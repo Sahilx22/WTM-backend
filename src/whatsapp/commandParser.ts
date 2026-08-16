@@ -1,0 +1,184 @@
+import type { ReportPeriod } from '../reports/taskMetrics.js'
+import type { TaskStatus, TaskFrequency, RecurrenceUnit } from '../db/schema.js'
+import { FREQUENCY_RE, TARGET_DATE_RE, frequencyFromMatch } from './taskParser.js'
+
+export type ParsedCommand =
+  | { type: 'help' }
+  | { type: 'status'; query: string; statusFilter?: TaskStatus; dateFrom?: Date; dateTo?: Date }
+  | {
+      type: 'report'
+      period: ReportPeriod
+      recipient?: string
+      statusFilter?: TaskStatus
+      dateFrom?: Date
+      dateTo?: Date
+    }
+  | { type: 'complete'; taskId: number }
+  | { type: 'remind'; taskId: number; stop: true }
+  | { type: 'remind'; taskId: number; stop: false; frequency: TaskFrequency; targetDate?: Date }
+  | { type: 'recur'; taskId: number; off: true }
+  | { type: 'recur'; taskId: number; off: false; intervalValue: number; intervalUnit: RecurrenceUnit; time?: string }
+
+const PERIOD_KEYWORDS = new Set(['daily', 'weekly', 'monthly'])
+
+const STATUS_KEYWORDS: Record<string, TaskStatus> = {
+  pending: 'pending',
+  completed: 'completed',
+  done: 'completed',
+  review: 'needs_review',
+  reviewing: 'needs_review'
+}
+
+const FROM_RE = /\bfrom\s+(\d{4}-\d{2}-\d{2})\b/i
+const TO_RE = /\bto\s+(\d{4}-\d{2}-\d{2})\b/i
+const RECUR_RE = /\bevery\s+(\d+)\s+(day|days|week|weeks)\b/i
+const AT_TIME_RE = /\bat\s+([01]\d|2[0-3]):([0-5]\d)\b/i
+
+// Shared by /status and /report — pulls out "from YYYY-MM-DD" / "to
+// YYYY-MM-DD" (either, both, in any order) and returns the remaining text
+// with those tokens removed so the rest of the grammar doesn't have to know
+// about them.
+function extractDateRange(text: string): { from?: Date; to?: Date; rest: string } {
+  let rest = text
+  let from: Date | undefined
+  let to: Date | undefined
+
+  const fromMatch = rest.match(FROM_RE)
+  if (fromMatch?.[1] && fromMatch.index !== undefined) {
+    from = new Date(fromMatch[1])
+    rest = rest.slice(0, fromMatch.index) + rest.slice(fromMatch.index + fromMatch[0].length)
+  }
+
+  const toMatch = rest.match(TO_RE)
+  if (toMatch?.[1] && toMatch.index !== undefined) {
+    to = new Date(toMatch[1])
+    rest = rest.slice(0, toMatch.index) + rest.slice(toMatch.index + toMatch[0].length)
+  }
+
+  return { from, to, rest: rest.replace(/\s+/g, ' ').trim() }
+}
+
+function parseTaskRef(token: string | undefined): number | null {
+  if (!token) return null
+  const id = Number(token.replace(/^#/, ''))
+  return Number.isInteger(id) && id > 0 ? id : null
+}
+
+// Slash commands typed into your own self-chat:
+//   /help
+//   /status <task or employee name> [pending|completed|review] [from YYYY-MM-DD] [to YYYY-MM-DD]
+//   /report [daily|weekly|monthly] [pending|completed|review] [<name or number>] [from YYYY-MM-DD] [to YYYY-MM-DD]
+//   /complete <id>
+//   /remind <id> every hourly|daily|weekly [until YYYY-MM-DD]
+//   /remind <id> stop
+//   /recur <id> every <N> days|weeks [at HH:MM]
+//   /recur <id> off
+export function parseCommand(text: string): ParsedCommand | null {
+  const trimmed = text.trim()
+  if (!trimmed.startsWith('/')) return null
+
+  const firstSpace = trimmed.indexOf(' ')
+  const cmd = (firstSpace === -1 ? trimmed.slice(1) : trimmed.slice(1, firstSpace)).toLowerCase()
+  const argsText = firstSpace === -1 ? '' : trimmed.slice(firstSpace + 1).trim()
+
+  if (!cmd) return null
+
+  if (cmd === 'help') return { type: 'help' }
+
+  if (cmd === 'status') {
+    const { from, to, rest } = extractDateRange(argsText)
+    let queryParts = rest.split(/\s+/).filter((p) => p.length > 0)
+    let statusFilter: TaskStatus | undefined
+
+    const lastToken = queryParts[queryParts.length - 1]?.toLowerCase()
+    if (lastToken && lastToken in STATUS_KEYWORDS) {
+      statusFilter = STATUS_KEYWORDS[lastToken]
+      queryParts = queryParts.slice(0, -1)
+    }
+
+    const query = queryParts.join(' ').trim()
+    // Bare "/status pending" (or a bare date range) is valid — only reject
+    // when there's nothing at all to search or filter by.
+    if (!query && !statusFilter && !from && !to) return null
+    return { type: 'status', query, statusFilter, dateFrom: from, dateTo: to }
+  }
+
+  if (cmd === 'report') {
+    const { from, to, rest } = extractDateRange(argsText)
+    let parts = rest.split(/\s+/).filter((p) => p.length > 0)
+    let period: ReportPeriod = 'all'
+    let statusFilter: TaskStatus | undefined
+
+    // Period and status keywords can each appear anywhere among the
+    // remaining words (not just trailing) — pull both out, whatever's left
+    // is the recipient filter text.
+    const remaining: string[] = []
+    for (const part of parts) {
+      const lower = part.toLowerCase()
+      if (!statusFilter && lower in STATUS_KEYWORDS) {
+        statusFilter = STATUS_KEYWORDS[lower]
+      } else if (period === 'all' && PERIOD_KEYWORDS.has(lower)) {
+        period = lower as ReportPeriod
+      } else {
+        remaining.push(part)
+      }
+    }
+    parts = remaining
+
+    // An explicit date range replaces the coarse period bucket entirely.
+    if (from || to) period = 'all'
+
+    const recipient = parts.join(' ').trim()
+    return { type: 'report', period, recipient: recipient || undefined, statusFilter, dateFrom: from, dateTo: to }
+  }
+
+  if (cmd === 'complete') {
+    const taskId = parseTaskRef(argsText.split(/\s+/)[0])
+    if (!taskId) return null
+    return { type: 'complete', taskId }
+  }
+
+  if (cmd === 'remind') {
+    const parts = argsText.split(/\s+/).filter((p) => p.length > 0)
+    const taskId = parseTaskRef(parts[0])
+    if (!taskId) return null
+    const rest = parts.slice(1).join(' ')
+
+    if (/^stop$/i.test(rest.trim())) {
+      return { type: 'remind', taskId, stop: true }
+    }
+
+    const freqMatch = rest.match(FREQUENCY_RE)
+    if (!freqMatch?.[1]) return null
+    const frequency = frequencyFromMatch(freqMatch[1])
+
+    const dateMatch = rest.match(TARGET_DATE_RE)
+    const targetDate = dateMatch?.[1] ? new Date(dateMatch[1]) : undefined
+
+    return { type: 'remind', taskId, stop: false, frequency, targetDate }
+  }
+
+  if (cmd === 'recur') {
+    const parts = argsText.split(/\s+/).filter((p) => p.length > 0)
+    const taskId = parseTaskRef(parts[0])
+    if (!taskId) return null
+    const rest = parts.slice(1).join(' ')
+
+    if (/^off$/i.test(rest.trim())) {
+      return { type: 'recur', taskId, off: true }
+    }
+
+    const recurMatch = rest.match(RECUR_RE)
+    if (!recurMatch?.[1] || !recurMatch[2]) return null
+    const intervalValue = Number(recurMatch[1])
+    if (!Number.isInteger(intervalValue) || intervalValue < 1) return null
+    const intervalUnit: RecurrenceUnit = recurMatch[2].toLowerCase().startsWith('day') ? 'days' : 'weeks'
+
+    const timeMatch = rest.match(AT_TIME_RE)
+    const time = timeMatch ? `${timeMatch[1]}:${timeMatch[2]}` : undefined
+
+    return { type: 'recur', taskId, off: false, intervalValue, intervalUnit, time }
+  }
+
+  return null
+}
