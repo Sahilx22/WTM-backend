@@ -1,0 +1,40 @@
+# Deployed as its own Render Blueprint, pointed at this file
+# (backend/render.yaml) — independent from frontend/render.yaml.
+services:
+  - type: web
+    name: wa-automation-backend
+    env: node
+    plan: starter # needs to stay always-on (WhatsApp socket + scheduled jobs) — free tier spins down on idle
+    region: singapore # pick whatever's closest to you / your Supabase region
+    # rootDir is relative to the repo root regardless of where this file
+    # lives — keep it explicit even though this yaml already sits in backend/.
+    rootDir: backend
+    buildCommand: npm install && npm run build
+    startCommand: npm start
+    healthCheckPath: /api/health
+    envVars:
+      - key: NODE_ENV
+        value: production
+      - key: JWT_SECRET
+        generateValue: true # Render generates and stores a random secret for you
+      - key: DATABASE_URL
+        sync: false # paste your Supabase pooler connection string in the Render dashboard
+      - key: FRONTEND_ORIGIN
+        sync: false # fill in with the frontend service's Render URL after its first deploy
+      - key: S3_ACCESS_KEY_ID
+        sync: false
+      - key: S3_SECRET_ACCESS_KEY
+        sync: false
+      - key: S3_ENDPOINT
+        sync: false
+      - key: S3_REGION
+        sync: false
+      - key: S3_BUCKET
+        sync: false
+    disk:
+      # Persists the linked WhatsApp session (data/auth_info_baileys) across
+      # deploys/restarts — without this you'd have to re-scan the QR code
+      # every time the service redeploys or restarts. Requires a paid plan.
+      name: wa-automation-data
+      mountPath: /opt/render/project/src/backend/data
+      sizeGB: 1
