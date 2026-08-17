@@ -55,7 +55,9 @@ async function createTaskFromPhoneMessage(
       recipient_jid: recipientJid,
       contact_id: contactId,
       name: parsed.name,
-      reminder_frequency: parsed.frequency,
+      priority: parsed.priority,
+      reminder_times_per_day: parsed.timesPerDay,
+      reminder_interval_days: parsed.intervalDays,
       target_date: parsed.targetDate ? new Date(parsed.targetDate) : null,
       status: 'pending'
     })
@@ -67,8 +69,8 @@ async function createTaskFromPhoneMessage(
     .values({ task_id: created.id, wa_message_id: originalMessageId, kind: 'original' })
     .execute()
 
-  if (parsed.frequency) {
-    await scheduleNextReminder(created.id, parsed.frequency)
+  if (parsed.timesPerDay || parsed.intervalDays) {
+    await scheduleNextReminder(created.id)
   }
 
   logger.info({ taskId: created.id, name: parsed.name, recipientJid }, 'created task from phone message')
@@ -78,7 +80,14 @@ async function createTaskFromPhoneMessage(
     action: 'task_created_from_whatsapp',
     entityType: 'task',
     entityId: created.id,
-    metadata: { name: parsed.name, frequency: parsed.frequency, targetDate: parsed.targetDate, recipientJid }
+    metadata: {
+      name: parsed.name,
+      priority: parsed.priority,
+      timesPerDay: parsed.timesPerDay,
+      intervalDays: parsed.intervalDays,
+      targetDate: parsed.targetDate,
+      recipientJid
+    }
   })
 }
 

@@ -23,42 +23,33 @@ const checkboxField = z
   .optional()
   .transform((v) => v === 'true')
 
-export const taskSettingsSchema = z.object({
-  reminder_hourly_minutes: z.coerce.number().int().min(1).max(10080),
-  reminder_daily_minutes: z.coerce.number().int().min(1).max(10080),
-  reminder_weekly_minutes: z.coerce.number().int().min(1).max(43200),
-  auto_report_daily_enabled: checkboxField,
-  auto_report_daily_time: timeField,
-  auto_report_weekly_enabled: checkboxField,
-  auto_report_weekly_day: z.enum([
-    'monday',
-    'tuesday',
-    'wednesday',
-    'thursday',
-    'friday',
-    'saturday',
-    'sunday'
-  ]),
-  auto_report_weekly_time: timeField,
-  auto_report_monthly_enabled: checkboxField,
-  auto_report_monthly_day: z.coerce.number().int().min(1).max(28),
-  auto_report_monthly_time: timeField,
-  reminder_daily_time: timeField,
-  daily_overview_enabled: checkboxField,
-  daily_overview_time: timeField,
-  weekly_report_enabled: checkboxField,
-  weekly_report_day: z.enum([
-    'monday',
-    'tuesday',
-    'wednesday',
-    'thursday',
-    'friday',
-    'saturday',
-    'sunday'
-  ]),
-  weekly_report_time: timeField,
-  review_digest_enabled: checkboxField,
-  review_digest_time: timeField
-})
+export const taskSettingsSchema = z
+  .object({
+    // "2TAD"/"3TAD"/etc reminders get spread evenly across this window.
+    working_hours_start: timeField,
+    working_hours_end: timeField,
+    auto_report_daily_enabled: checkboxField,
+    auto_report_daily_time: timeField,
+    auto_report_weekly_enabled: checkboxField,
+    auto_report_weekly_day: z.enum(['monday', 'tuesday', 'wednesday', 'thursday', 'friday', 'saturday', 'sunday']),
+    auto_report_weekly_time: timeField,
+    auto_report_monthly_enabled: checkboxField,
+    auto_report_monthly_day: z.coerce.number().int().min(1).max(28),
+    auto_report_monthly_time: timeField,
+    // Anchor time for "1TAD" (once-a-day) reminders and "1IN2D"/"1IN3D" (once
+    // every N days) reminders.
+    reminder_daily_time: timeField,
+    daily_overview_enabled: checkboxField,
+    daily_overview_time: timeField,
+    weekly_report_enabled: checkboxField,
+    weekly_report_day: z.enum(['monday', 'tuesday', 'wednesday', 'thursday', 'friday', 'saturday', 'sunday']),
+    weekly_report_time: timeField,
+    review_digest_enabled: checkboxField,
+    review_digest_time: timeField
+  })
+  .refine((d) => d.working_hours_end > d.working_hours_start, {
+    message: 'Working hours end must be after the start.',
+    path: ['working_hours_end']
+  })
 
 export type TaskSettingsInput = z.infer<typeof taskSettingsSchema>

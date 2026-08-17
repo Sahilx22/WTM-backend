@@ -18,7 +18,9 @@ async function loadTasks(status: string, reminder: string) {
       'tasks.id',
       'tasks.recipient_jid',
       'tasks.name',
-      'tasks.reminder_frequency',
+      'tasks.priority',
+      'tasks.reminder_times_per_day',
+      'tasks.reminder_interval_days',
       'tasks.reminders_enabled',
       'tasks.target_date',
       'tasks.status',
@@ -35,16 +37,11 @@ async function loadTasks(status: string, reminder: string) {
     query = query.where('tasks.status', '=', status as never)
   }
 
-  if (reminder === 'on') {
+  if (reminder === 'on' || reminder === 'off') {
     query = query
       .where('tasks.status', '=', 'pending')
-      .where('tasks.reminders_enabled', '=', true)
-      .where('tasks.reminder_frequency', 'is not', null)
-  } else if (reminder === 'off') {
-    query = query
-      .where('tasks.status', '=', 'pending')
-      .where('tasks.reminders_enabled', '=', false)
-      .where('tasks.reminder_frequency', 'is not', null)
+      .where('tasks.reminders_enabled', '=', reminder === 'on')
+      .where((eb) => eb.or([eb('tasks.reminder_times_per_day', 'is not', null), eb('tasks.reminder_interval_days', 'is not', null)]))
   } else if (reminder === 'done') {
     query = query.where('tasks.status', 'in', ['needs_review', 'completed'])
   }
@@ -158,11 +155,11 @@ tasksRouter.post('/tasks/:id/toggle-reminders', async (req, res) => {
   const id = Number(req.params.id)
   const task = await db
     .selectFrom('tasks')
-    .select(['status', 'reminder_frequency', 'reminders_enabled', 'next_reminder_job_id'])
+    .select(['status', 'reminder_times_per_day', 'reminder_interval_days', 'reminders_enabled', 'next_reminder_job_id'])
     .where('id', '=', id)
     .executeTakeFirst()
 
-  if (task && task.status === 'pending' && task.reminder_frequency) {
+  if (task && task.status === 'pending' && (task.reminder_times_per_day || task.reminder_interval_days)) {
     if (task.reminders_enabled) {
       await cancelTaskReminder(task.next_reminder_job_id)
       await db
@@ -176,7 +173,7 @@ tasksRouter.post('/tasks/:id/toggle-reminders', async (req, res) => {
         .set({ reminders_enabled: true, updated_at: new Date() })
         .where('id', '=', id)
         .execute()
-      await scheduleNextReminder(id, task.reminder_frequency)
+      await scheduleNextReminder(id)
     }
 
     await recordAuditLog({

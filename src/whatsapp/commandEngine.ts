@@ -9,7 +9,7 @@ import { recipientDisplayName } from '../lib/recipientDisplay.js'
 import { recordAuditLog } from '../lib/auditLog.js'
 import { scheduleNextReminder, cancelTaskReminder } from '../queue/taskReminders.js'
 import { scheduleRecurrence, cancelRecurrence } from '../queue/recurringTasks.js'
-import type { TaskStatus, TaskFrequency, RecurrenceUnit } from '../db/schema.js'
+import type { TaskStatus, TaskPriority, RecurrenceUnit } from '../db/schema.js'
 
 const logger = pino({ level: isProduction ? 'error' : 'warn' })
 
@@ -32,10 +32,12 @@ const HELP_TEXT = `*WA Messenger commands*
 
 *Act on a task* (get the #id from /status)
 /complete <id> — mark a task completed
-/remind <id> every hourly|daily|weekly [until YYYY-MM-DD] — set/change its reminder
+/remind <id> <N>TAD [until YYYY-MM-DD] — remind N times a day (spread across working hours; 1TAD uses the daily reminder time)
+/remind <id> 1IN<N>D [until YYYY-MM-DD] — remind once every N days
 /remind <id> stop — turn reminders off without deleting it
 /recur <id> every <N> days|weeks [at HH:MM] — recreate this task automatically N days/weeks after it's completed
-/recur <id> off — stop it from recreating`
+/recur <id> off — stop it from recreating
+/priority <id> P1|P2|P3|P4 — change a task's priority (P1 = critical … P4 = low)`
 
 const STATUS_LABEL: Record<string, string> = {
   pending: 'Pending',
@@ -65,6 +67,7 @@ async function handleStatusCommand(
     .select([
       'tasks.id',
       'tasks.name',
+      'tasks.priority',
       'tasks.status',
       'tasks.recipient_jid',
       'tasks.target_date',
@@ -113,7 +116,7 @@ async function handleStatusCommand(
   const lines = matches.map((t) => {
     const who = recipientDisplayName(t.recipient_jid, t.contactName, t.groupSubject)
     const due = t.target_date ? ` (due ${new Date(t.target_date).toISOString().slice(0, 10)})` : ''
-    return `#${t.id} *${t.name}* — ${who} — ${STATUS_LABEL[t.status] ?? t.status}${due}`
+    return `#${t.id} [${t.priority}] *${t.name}* — ${who} — ${STATUS_LABEL[t.status] ?? t.status}${due}`
   })
 
   const summary = `${counts.pending} pending, ${counts.needs_review} in review, ${counts.completed} completed`
@@ -184,7 +187,7 @@ async function handleRemindCommand(
   sock: WASocket,
   ownJid: string,
   taskId: number,
-  update: { stop: true } | { stop: false; frequency: TaskFrequency; targetDate?: Date }
+  update: { stop: true } | { stop: false; timesPerDay: number | null; intervalDays: number | null; targetDate?: Date }
 ): Promise<void> {
   const task = await db.selectFrom('tasks').selectAll().where('id', '=', taskId).executeTakeFirst()
   if (!task) {
@@ -207,7 +210,8 @@ async function handleRemindCommand(
   await db
     .updateTable('tasks')
     .set({
-      reminder_frequency: update.frequency,
+      reminder_times_per_day: update.timesPerDay,
+      reminder_interval_days: update.intervalDays,
       target_date: update.targetDate ?? task.target_date,
       reminders_enabled: true,
       updated_at: new Date()
@@ -216,10 +220,23 @@ async function handleRemindCommand(
     .execute()
 
   if (task.status === 'pending') {
-    await scheduleNextReminder(taskId, update.frequency)
+    await scheduleNextReminder(taskId)
   }
 
-  await sock.sendMessage(ownJid, { text: `⏰ Reminder for *${task.name}* (#${taskId}) set to ${update.frequency}.` })
+  const cadenceText = update.timesPerDay ? `${update.timesPerDay}TAD` : `1IN${update.intervalDays}D`
+  await sock.sendMessage(ownJid, { text: `⏰ Reminder for *${task.name}* (#${taskId}) set to ${cadenceText}.` })
+}
+
+async function handlePriorityCommand(sock: WASocket, ownJid: string, taskId: number, priority: TaskPriority): Promise<void> {
+  const task = await db.selectFrom('tasks').select(['name']).where('id', '=', taskId).executeTakeFirst()
+  if (!task) {
+    await sock.sendMessage(ownJid, { text: `Task #${taskId} not found.` })
+    return
+  }
+
+  await db.updateTable('tasks').set({ priority, updated_at: new Date() }).where('id', '=', taskId).execute()
+
+  await sock.sendMessage(ownJid, { text: `🔥 Priority for *${task.name}* (#${taskId}) set to ${priority}.` })
 }
 
 async function handleRecurCommand(
@@ -306,7 +323,9 @@ export async function handleCommandMessage(sock: WASocket, ownJid: string | null
       sock,
       ownJid,
       command.taskId,
-      command.stop ? { stop: true } : { stop: false, frequency: command.frequency, targetDate: command.targetDate }
+      command.stop
+        ? { stop: true }
+        : { stop: false, timesPerDay: command.timesPerDay, intervalDays: command.intervalDays, targetDate: command.targetDate }
     )
   } else if (command.type === 'recur') {
     await handleRecurCommand(
@@ -317,5 +336,7 @@ export async function handleCommandMessage(sock: WASocket, ownJid: string | null
         ? { off: true }
         : { off: false, intervalValue: command.intervalValue, intervalUnit: command.intervalUnit, time: command.time }
     )
+  } else if (command.type === 'priority') {
+    await handlePriorityCommand(sock, ownJid, command.taskId, command.priority)
   }
 }

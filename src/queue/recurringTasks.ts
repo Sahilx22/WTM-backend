@@ -76,7 +76,9 @@ async function processRecurrence(taskId: number): Promise<void> {
       recipient_jid: original.recipient_jid,
       contact_id: original.contact_id,
       name: original.name,
-      reminder_frequency: original.reminder_frequency,
+      priority: original.priority,
+      reminder_times_per_day: original.reminder_times_per_day,
+      reminder_interval_days: original.reminder_interval_days,
       target_date: null,
       status: 'pending',
       is_recurring: true,
@@ -105,8 +107,8 @@ async function processRecurrence(taskId: number): Promise<void> {
     }
   }
 
-  if (original.reminder_frequency) {
-    await scheduleNextReminder(created.id, original.reminder_frequency)
+  if (original.reminder_times_per_day || original.reminder_interval_days) {
+    await scheduleNextReminder(created.id)
   }
 
   await db.updateTable('tasks').set({ next_recurrence_job_id: null }).where('id', '=', original.id).execute()

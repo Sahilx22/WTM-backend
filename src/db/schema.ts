@@ -204,7 +204,7 @@ export interface WaMessageCacheTable {
 }
 
 export type TaskStatus = 'pending' | 'needs_review' | 'completed'
-export type TaskFrequency = 'hourly' | 'daily' | 'weekly'
+export type TaskPriority = 'P1' | 'P2' | 'P3' | 'P4'
 export type TaskMessageKind = 'original' | 'reminder'
 export type RecurrenceUnit = 'days' | 'weeks'
 
@@ -213,7 +213,12 @@ export interface TasksTable {
   recipient_jid: string
   contact_id: number | null
   name: string
-  reminder_frequency: TaskFrequency | null
+  priority: Generated<TaskPriority>
+  // Mutually exclusive reminder modes: N times a day (1TAD/2TAD/3TAD, spread
+  // across working hours), or once every N days (1IN2D/1IN3D). Neither set
+  // means no repeating reminder.
+  reminder_times_per_day: number | null
+  reminder_interval_days: number | null
   target_date: Date | null
   status: Generated<TaskStatus>
   reminders_enabled: Generated<boolean>
@@ -243,9 +248,8 @@ export type WeekDay = 'monday' | 'tuesday' | 'wednesday' | 'thursday' | 'friday'
 
 export interface TaskSettingsTable {
   id: Generated<number>
-  reminder_hourly_minutes: Generated<number>
-  reminder_daily_minutes: Generated<number>
-  reminder_weekly_minutes: Generated<number>
+  working_hours_start: Generated<string>
+  working_hours_end: Generated<string>
   auto_report_daily_enabled: Generated<boolean>
   auto_report_daily_time: Generated<string>
   auto_report_weekly_enabled: Generated<boolean>

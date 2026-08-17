@@ -1,6 +1,6 @@
 import type { ReportPeriod } from '../reports/taskMetrics.js'
-import type { TaskStatus, TaskFrequency, RecurrenceUnit } from '../db/schema.js'
-import { FREQUENCY_RE, TARGET_DATE_RE, frequencyFromMatch } from './taskParser.js'
+import type { TaskStatus, TaskPriority, RecurrenceUnit } from '../db/schema.js'
+import { TIMES_PER_DAY_RE, INTERVAL_DAYS_RE, TARGET_DATE_RE, PRIORITY_RE } from './taskParser.js'
 
 export type ParsedCommand =
   | { type: 'help' }
@@ -15,9 +15,17 @@ export type ParsedCommand =
     }
   | { type: 'complete'; taskId: number }
   | { type: 'remind'; taskId: number; stop: true }
-  | { type: 'remind'; taskId: number; stop: false; frequency: TaskFrequency; targetDate?: Date }
+  | {
+      type: 'remind'
+      taskId: number
+      stop: false
+      timesPerDay: number | null
+      intervalDays: number | null
+      targetDate?: Date
+    }
   | { type: 'recur'; taskId: number; off: true }
   | { type: 'recur'; taskId: number; off: false; intervalValue: number; intervalUnit: RecurrenceUnit; time?: string }
+  | { type: 'priority'; taskId: number; priority: TaskPriority }
 
 const PERIOD_KEYWORDS = new Set(['daily', 'weekly', 'monthly'])
 
@@ -69,10 +77,11 @@ function parseTaskRef(token: string | undefined): number | null {
 //   /status <task or employee name> [pending|completed|review] [from YYYY-MM-DD] [to YYYY-MM-DD]
 //   /report [daily|weekly|monthly] [pending|completed|review] [<name or number>] [from YYYY-MM-DD] [to YYYY-MM-DD]
 //   /complete <id>
-//   /remind <id> every hourly|daily|weekly [until YYYY-MM-DD]
+//   /remind <id> <N>TAD|1IN<N>D [until YYYY-MM-DD]
 //   /remind <id> stop
 //   /recur <id> every <N> days|weeks [at HH:MM]
 //   /recur <id> off
+//   /priority <id> P1|P2|P3|P4
 export function parseCommand(text: string): ParsedCommand | null {
   const trimmed = text.trim()
   if (!trimmed.startsWith('/')) return null
@@ -148,14 +157,17 @@ export function parseCommand(text: string): ParsedCommand | null {
       return { type: 'remind', taskId, stop: true }
     }
 
-    const freqMatch = rest.match(FREQUENCY_RE)
-    if (!freqMatch?.[1]) return null
-    const frequency = frequencyFromMatch(freqMatch[1])
+    const tadMatch = rest.match(TIMES_PER_DAY_RE)
+    const intervalMatch = rest.match(INTERVAL_DAYS_RE)
+    if (!tadMatch?.[1] && !intervalMatch?.[1]) return null
+
+    const timesPerDay = tadMatch?.[1] ? Number(tadMatch[1]) : null
+    const intervalDays = intervalMatch?.[1] ? Number(intervalMatch[1]) : null
 
     const dateMatch = rest.match(TARGET_DATE_RE)
     const targetDate = dateMatch?.[1] ? new Date(dateMatch[1]) : undefined
 
-    return { type: 'remind', taskId, stop: false, frequency, targetDate }
+    return { type: 'remind', taskId, stop: false, timesPerDay, intervalDays, targetDate }
   }
 
   if (cmd === 'recur') {
@@ -178,6 +190,18 @@ export function parseCommand(text: string): ParsedCommand | null {
     const time = timeMatch ? `${timeMatch[1]}:${timeMatch[2]}` : undefined
 
     return { type: 'recur', taskId, off: false, intervalValue, intervalUnit, time }
+  }
+
+  if (cmd === 'priority') {
+    const parts = argsText.split(/\s+/).filter((p) => p.length > 0)
+    const taskId = parseTaskRef(parts[0])
+    if (!taskId) return null
+    const rest = parts.slice(1).join(' ')
+
+    const priorityMatch = rest.match(PRIORITY_RE)
+    if (!priorityMatch?.[1]) return null
+
+    return { type: 'priority', taskId, priority: `P${priorityMatch[1]}` as TaskPriority }
   }
 
   return null
