@@ -24,6 +24,13 @@ export const app = express()
 
 app.disable('x-powered-by')
 
+// Render (and most PaaS hosts) sit the app behind one reverse proxy that
+// sets X-Forwarded-For — trusting exactly one hop lets Express (and
+// express-rate-limit, which refuses to run otherwise) resolve the real
+// client IP instead of the proxy's, without blindly trusting an arbitrary
+// chain of forwarded headers a client could spoof.
+app.set('trust proxy', 1)
+
 app.use(
   helmet({
     contentSecurityPolicy: false
