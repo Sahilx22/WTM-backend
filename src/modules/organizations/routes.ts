@@ -7,14 +7,18 @@ import { createOrganizationSchema, updateOrganizationSchema } from './schemas.js
 
 export const organizationsRouter = Router()
 
-organizationsRouter.use(requireSuperAdmin)
-
-organizationsRouter.get('/organizations', async (_req, res) => {
+// Applied per-route below rather than as a router-wide `.use()`: this router
+// is mounted at the API root alongside every other module router, and a
+// path-less `.use()` here would run for *any* request that falls through to
+// it — including ones meant for routers mounted after it (e.g. tasks,
+// reports) — blocking them with a super-admin check they were never meant
+// to have.
+organizationsRouter.get('/organizations', requireSuperAdmin, async (_req, res) => {
   const organizations = await db.selectFrom('organizations').selectAll().orderBy('created_at', 'desc').execute()
   res.json({ organizations })
 })
 
-organizationsRouter.get('/organizations/:id', async (req, res) => {
+organizationsRouter.get('/organizations/:id', requireSuperAdmin, async (req, res) => {
   const id = Number(req.params.id)
   const organization = await db.selectFrom('organizations').selectAll().where('id', '=', id).executeTakeFirst()
 
@@ -26,7 +30,7 @@ organizationsRouter.get('/organizations/:id', async (req, res) => {
   res.json({ organization })
 })
 
-organizationsRouter.post('/organizations', async (req, res) => {
+organizationsRouter.post('/organizations', requireSuperAdmin, async (req, res) => {
   const parsed = createOrganizationSchema.safeParse(req.body)
 
   if (!parsed.success) {
@@ -78,7 +82,7 @@ organizationsRouter.post('/organizations', async (req, res) => {
   res.status(201).json(result)
 })
 
-organizationsRouter.put('/organizations/:id', async (req, res) => {
+organizationsRouter.put('/organizations/:id', requireSuperAdmin, async (req, res) => {
   const id = Number(req.params.id)
   const parsed = updateOrganizationSchema.safeParse(req.body)
 
