@@ -5,6 +5,7 @@ import { db } from '../db/index.js'
 import { getSocket, getSnapshot } from '../whatsapp/connectionManager.js'
 import { getReportData, type ReportPeriod } from '../reports/taskMetrics.js'
 import { renderTaskReportPdf } from '../reports/taskReportPdf.js'
+import { loadReportBranding } from '../reports/branding.js'
 import { isProduction } from '../config/env.js'
 import type { TaskSettings } from '../db/schema.js'
 
@@ -87,8 +88,8 @@ async function sendAutoReport(period: ReportPeriod): Promise<void> {
   }
 
   try {
-    const data = await getReportData(period)
-    const pdf = await renderTaskReportPdf(data)
+    const [data, branding] = await Promise.all([getReportData(period), loadReportBranding()])
+    const pdf = await renderTaskReportPdf(data, branding)
     const filename = `task-report-${period}-${new Date().toISOString().slice(0, 10)}.pdf`
 
     await sock.sendMessage(snapshot.waJid, {

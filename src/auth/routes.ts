@@ -61,8 +61,32 @@ authRouter.post('/auth/login', authRateLimit, async (req, res) => {
     ipAddress: req.ip
   })
 
-  const token = signToken({ id: user.id, username: user.username })
-  res.json({ token, user: { id: user.id, username: user.username, displayName: user.display_name } })
+  const token = signToken({
+    id: user.id,
+    username: user.username,
+    organizationId: user.organization_id,
+    isSuperAdmin: user.is_super_admin
+  })
+
+  const organization = user.organization_id
+    ? await db
+        .selectFrom('organizations')
+        .select(['id', 'name', 'logo_url'])
+        .where('id', '=', user.organization_id)
+        .executeTakeFirst()
+    : null
+
+  res.json({
+    token,
+    user: {
+      id: user.id,
+      username: user.username,
+      displayName: user.display_name,
+      organizationId: user.organization_id,
+      isSuperAdmin: user.is_super_admin,
+      organization: organization ? { id: organization.id, name: organization.name, logoUrl: organization.logo_url } : null
+    }
+  })
 })
 
 authRouter.post('/auth/logout', requireAuth, async (req, res) => {
@@ -73,7 +97,7 @@ authRouter.post('/auth/logout', requireAuth, async (req, res) => {
 authRouter.get('/auth/me', requireAuth, async (req, res) => {
   const user = await db
     .selectFrom('users')
-    .select(['id', 'username', 'display_name'])
+    .select(['id', 'username', 'display_name', 'organization_id', 'is_super_admin'])
     .where('id', '=', req.user!.id)
     .executeTakeFirst()
 
@@ -82,5 +106,22 @@ authRouter.get('/auth/me', requireAuth, async (req, res) => {
     return
   }
 
-  res.json({ user: { id: user.id, username: user.username, displayName: user.display_name } })
+  const organization = user.organization_id
+    ? await db
+        .selectFrom('organizations')
+        .select(['id', 'name', 'logo_url'])
+        .where('id', '=', user.organization_id)
+        .executeTakeFirst()
+    : null
+
+  res.json({
+    user: {
+      id: user.id,
+      username: user.username,
+      displayName: user.display_name,
+      organizationId: user.organization_id,
+      isSuperAdmin: user.is_super_admin,
+      organization: organization ? { id: organization.id, name: organization.name, logoUrl: organization.logo_url } : null
+    }
+  })
 })

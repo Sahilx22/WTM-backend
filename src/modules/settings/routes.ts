@@ -1,6 +1,6 @@
 import { Router } from 'express'
 import { db } from '../../db/index.js'
-import { rateLimitConfigSchema, taskSettingsSchema } from './schemas.js'
+import { rateLimitConfigSchema, taskSettingsSchema, brandingSchema } from './schemas.js'
 import { recordAuditLog } from '../../lib/auditLog.js'
 import { resetConsecutiveFailureCounter } from '../../queue/rateLimiter.js'
 import { restartOutgoingWorker } from '../../queue/outgoingWorker.js'
@@ -13,9 +13,64 @@ async function loadConfig() {
   return db.selectFrom('rate_limit_config').selectAll().where('id', '=', 1).executeTakeFirstOrThrow()
 }
 
-settingsRouter.get('/settings', async (_req, res) => {
+settingsRouter.get('/settings', async (req, res) => {
   const [config, taskSettings] = await Promise.all([loadConfig(), loadTaskSettings()])
-  res.json({ config, taskSettings })
+
+  const organization = req.user?.organizationId
+    ? await db
+        .selectFrom('organizations')
+        .select(['id', 'name', 'logo_url', 'admin_wa_number'])
+        .where('id', '=', req.user.organizationId)
+        .executeTakeFirst()
+    : null
+
+  res.json({
+    config,
+    taskSettings,
+    organization: organization
+      ? { id: organization.id, name: organization.name, logoUrl: organization.logo_url, adminWaNumber: organization.admin_wa_number }
+      : null
+  })
+})
+
+settingsRouter.post('/settings/branding', async (req, res) => {
+  if (!req.user?.organizationId) {
+    res.status(403).json({ error: 'No organization to update.' })
+    return
+  }
+
+  const parsed = brandingSchema.safeParse(req.body)
+
+  if (!parsed.success) {
+    res.status(400).json({ error: parsed.error.issues[0]?.message ?? 'Invalid input.' })
+    return
+  }
+
+  const { name, logo_url } = parsed.data
+
+  const organization = await db
+    .updateTable('organizations')
+    .set({
+      ...(name !== undefined ? { name } : {}),
+      ...(logo_url !== undefined ? { logo_url: logo_url === '' ? null : logo_url } : {}),
+      updated_at: new Date()
+    })
+    .where('id', '=', req.user.organizationId)
+    .returning(['id', 'name', 'logo_url', 'admin_wa_number'])
+    .executeTakeFirstOrThrow()
+
+  await recordAuditLog({
+    userId: req.user?.id ?? null,
+    action: 'branding_updated',
+    entityType: 'organization',
+    entityId: organization.id,
+    metadata: parsed.data,
+    ipAddress: req.ip
+  })
+
+  res.json({
+    organization: { id: organization.id, name: organization.name, logoUrl: organization.logo_url, adminWaNumber: organization.admin_wa_number }
+  })
 })
 
 settingsRouter.post('/settings', async (req, res) => {

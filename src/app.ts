@@ -15,6 +15,7 @@ import { campaignsRouter } from './modules/campaigns/routes.js'
 import { historyRouter } from './modules/history/routes.js'
 import { dashboardRouter } from './modules/dashboard/routes.js'
 import { settingsRouter } from './modules/settings/routes.js'
+import { organizationsRouter } from './modules/organizations/routes.js'
 import { tasksRouter } from './modules/tasks/routes.js'
 import { reportsRouter } from './modules/reports/routes.js'
 import { notFound, errorHandler } from './middleware/errorHandler.js'
@@ -65,6 +66,7 @@ apiRouter.use(campaignsRouter)
 apiRouter.use(historyRouter)
 apiRouter.use(dashboardRouter)
 apiRouter.use(settingsRouter)
+apiRouter.use(organizationsRouter)
 apiRouter.use(tasksRouter)
 apiRouter.use(reportsRouter)
 

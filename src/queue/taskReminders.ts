@@ -3,6 +3,7 @@ import pino from 'pino'
 import { boss } from './boss.js'
 import { db } from '../db/index.js'
 import { getSocket, getSnapshot } from '../whatsapp/connectionManager.js'
+import { formatShortDate } from '../lib/dateFormat.js'
 import { isProduction } from '../config/env.js'
 
 const logger = pino({ level: isProduction ? 'error' : 'warn' })
@@ -164,7 +165,7 @@ async function processTaskReminder(taskId: number): Promise<void> {
     return
   }
 
-  const dueText = task.target_date ? ` (due ${new Date(task.target_date).toISOString().slice(0, 10)})` : ''
+  const dueText = task.target_date ? ` (due ${formatShortDate(new Date(task.target_date))})` : ''
   const text = `⏰ [${task.priority}] Reminder: ${task.name}${dueText}`
 
   try {
@@ -172,11 +173,21 @@ async function processTaskReminder(taskId: number): Promise<void> {
     if (result?.key?.id) {
       await db
         .insertInto('task_messages')
-        .values({ task_id: taskId, wa_message_id: result.key.id, kind: 'reminder' })
+        .values({ task_id: taskId, wa_message_id: result.key.id, kind: 'reminder', status: 'sent' })
+        .execute()
+    } else {
+      await db
+        .insertInto('task_messages')
+        .values({ task_id: taskId, wa_message_id: null, kind: 'reminder', status: 'failed', error_message: 'Send did not return a message key.' })
         .execute()
     }
   } catch (err) {
+    const errorMessage = err instanceof Error ? err.message : 'Unknown send error'
     logger.warn({ err, taskId }, 'failed to send task reminder')
+    await db
+      .insertInto('task_messages')
+      .values({ task_id: taskId, wa_message_id: null, kind: 'reminder', status: 'failed', error_message: errorMessage })
+      .execute()
   }
 
   await db

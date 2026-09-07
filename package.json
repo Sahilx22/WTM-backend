@@ -7,7 +7,8 @@
     "typecheck": "tsc --noEmit",
     "migrate": "tsx src/db/migrate.ts up",
     "migrate:down": "tsx src/db/migrate.ts down",
-    "create-admin": "tsx scripts/create-admin.ts"
+    "create-admin": "tsx scripts/create-admin.ts",
+    "db:reset": "tsx scripts/reset-db.ts"
   },
   "dependencies": {
     "@aws-sdk/client-s3": "^3.1111.0",

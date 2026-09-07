@@ -9,7 +9,7 @@ import { getSocket } from '../../whatsapp/connectionManager.js'
 
 export const tasksRouter = Router()
 
-async function loadTasks(status: string, reminder: string) {
+async function loadTasks(status: string, reminder: string, category: string) {
   let query = db
     .selectFrom('tasks')
     .leftJoin('contacts', 'contacts.id', 'tasks.contact_id')
@@ -18,6 +18,7 @@ async function loadTasks(status: string, reminder: string) {
       'tasks.id',
       'tasks.recipient_jid',
       'tasks.name',
+      'tasks.category',
       'tasks.priority',
       'tasks.reminder_times_per_day',
       'tasks.reminder_interval_days',
@@ -37,6 +38,10 @@ async function loadTasks(status: string, reminder: string) {
     query = query.where('tasks.status', '=', status as never)
   }
 
+  if (category) {
+    query = query.where('tasks.category', '=', category)
+  }
+
   if (reminder === 'on' || reminder === 'off') {
     query = query
       .where('tasks.status', '=', 'pending')
@@ -53,8 +58,74 @@ async function loadTasks(status: string, reminder: string) {
 tasksRouter.get('/tasks', async (req, res) => {
   const status = typeof req.query.status === 'string' ? req.query.status : ''
   const reminder = typeof req.query.reminder === 'string' ? req.query.reminder : ''
-  const tasks = await loadTasks(status, reminder)
+  const category = typeof req.query.category === 'string' ? req.query.category : ''
+  const tasks = await loadTasks(status, reminder, category)
   res.json({ tasks })
+})
+
+// Chat notes logged whenever someone quote-replies to this task's original
+// message or a reminder for it (see whatsapp/taskEngine.ts).
+tasksRouter.get('/tasks/:id/notes', async (req, res) => {
+  const id = Number(req.params.id)
+  const notes = await db.selectFrom('task_notes').selectAll().where('task_id', '=', id).orderBy('created_at', 'asc').execute()
+  res.json({ notes })
+})
+
+// Overview of the reminder pipeline: what's still scheduled to go out, and
+// the recent send/failure history (see queue/taskReminders.ts).
+tasksRouter.get('/tasks/reminders', async (_req, res) => {
+  const scheduledRows = await db
+    .selectFrom('tasks')
+    .leftJoin('contacts', 'contacts.id', 'tasks.contact_id')
+    .leftJoin('groups', 'groups.wa_jid', 'tasks.recipient_jid')
+    .select([
+      'tasks.id',
+      'tasks.name',
+      'tasks.recipient_jid',
+      'tasks.reminder_times_per_day',
+      'tasks.reminder_interval_days',
+      'tasks.next_reminder_at',
+      'tasks.last_reminder_sent_at',
+      'contacts.display_name as contactName',
+      'groups.subject as groupSubject'
+    ])
+    .where('tasks.status', '=', 'pending')
+    .where('tasks.reminders_enabled', '=', true)
+    .where((eb) => eb.or([eb('tasks.reminder_times_per_day', 'is not', null), eb('tasks.reminder_interval_days', 'is not', null)]))
+    .orderBy('tasks.next_reminder_at', 'asc')
+    .execute()
+
+  const historyRows = await db
+    .selectFrom('task_messages')
+    .innerJoin('tasks', 'tasks.id', 'task_messages.task_id')
+    .leftJoin('contacts', 'contacts.id', 'tasks.contact_id')
+    .leftJoin('groups', 'groups.wa_jid', 'tasks.recipient_jid')
+    .select([
+      'task_messages.id',
+      'task_messages.task_id',
+      'task_messages.status',
+      'task_messages.error_message',
+      'task_messages.sent_at',
+      'tasks.name as taskName',
+      'tasks.recipient_jid',
+      'contacts.display_name as contactName',
+      'groups.subject as groupSubject'
+    ])
+    .where('task_messages.kind', '=', 'reminder')
+    .orderBy('task_messages.sent_at', 'desc')
+    .limit(100)
+    .execute()
+
+  const withRecipientName = <T extends { recipient_jid: string; contactName: string | null; groupSubject: string | null }>(row: T) => ({
+    ...row,
+    recipientName: recipientDisplayName(row.recipient_jid, row.contactName, row.groupSubject)
+  })
+
+  res.json({
+    scheduled: scheduledRows.map(withRecipientName),
+    sent: historyRows.filter((r) => r.status === 'sent').map(withRecipientName),
+    failed: historyRows.filter((r) => r.status === 'failed').map(withRecipientName)
+  })
 })
 
 // Re-attempts contact matching for tasks that came in with no linked

@@ -1,5 +1,6 @@
 import { db } from '../db/index.js'
 import { recipientDisplayName } from '../lib/recipientDisplay.js'
+import { formatShortDate } from '../lib/dateFormat.js'
 import type { TaskStatus } from '../db/schema.js'
 
 export type ReportPeriod = 'daily' | 'weekly' | 'monthly' | 'all'
@@ -7,6 +8,19 @@ export type ReportPeriod = 'daily' | 'weekly' | 'monthly' | 'all'
 export interface DateRange {
   from?: Date
   to?: Date
+}
+
+export const STATUS_LABEL: Record<TaskStatus, string> = {
+  pending: 'Pending',
+  needs_review: 'Needs Review',
+  completed: 'Completed'
+}
+
+export interface ReportFilters {
+  recipient?: string
+  status?: TaskStatus
+  category?: string
+  dateRange?: DateRange
 }
 
 export interface EmployeeMetrics {
@@ -26,6 +40,7 @@ export interface ReportData {
   period: ReportPeriod
   periodLabel: string
   generatedAt: Date
+  filters: ReportFilters
   employees: EmployeeMetrics[]
   overall: {
     total: number
@@ -50,8 +65,8 @@ function periodStart(period: ReportPeriod): Date | null {
 
 function periodLabel(period: ReportPeriod, range?: DateRange): string {
   if (range?.from || range?.to) {
-    const fromLabel = range.from ? range.from.toISOString().slice(0, 10) : '…'
-    const toLabel = range.to ? range.to.toISOString().slice(0, 10) : '…'
+    const fromLabel = range.from ? formatShortDate(range.from) : '…'
+    const toLabel = range.to ? formatShortDate(range.to) : '…'
     return `${fromLabel} – ${toLabel}`
   }
   switch (period) {
@@ -70,7 +85,8 @@ export async function getReportData(
   period: ReportPeriod,
   recipientFilter?: string,
   statusFilter?: TaskStatus,
-  dateRange?: DateRange
+  dateRange?: DateRange,
+  category?: string
 ): Promise<ReportData> {
   let query = db
     .selectFrom('tasks')
@@ -103,6 +119,10 @@ export async function getReportData(
 
   if (statusFilter) {
     query = query.where('tasks.status', '=', statusFilter)
+  }
+
+  if (category) {
+    query = query.where('tasks.category', '=', category)
   }
 
   if (recipientFilter?.trim()) {
@@ -171,6 +191,12 @@ export async function getReportData(
     period,
     periodLabel: periodLabel(period, dateRange),
     generatedAt: new Date(),
+    filters: {
+      recipient: recipientFilter?.trim() || undefined,
+      status: statusFilter,
+      category: category || undefined,
+      dateRange: dateRange?.from || dateRange?.to ? dateRange : undefined
+    },
     employees,
     overall: {
       total: overallTotal,

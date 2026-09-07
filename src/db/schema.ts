@@ -24,6 +24,16 @@ export type ContactSource = 'manual' | 'csv' | 'whatsapp'
 export type AttemptStatus = 'success' | 'failure'
 export type CsvRowValidity = 'valid' | 'duplicate' | 'invalid'
 
+export interface OrganizationsTable {
+  id: Generated<number>
+  name: string
+  logo_url: string | null
+  admin_wa_number: string | null
+  is_active: Generated<boolean>
+  created_at: Generated<Date>
+  updated_at: Generated<Date>
+}
+
 export interface UsersTable {
   id: Generated<number>
   username: string
@@ -33,6 +43,9 @@ export interface UsersTable {
   last_login_at: Date | null
   created_at: Generated<Date>
   updated_at: Generated<Date>
+  // Null for the super-admin account only — every regular org user has this set.
+  organization_id: number | null
+  is_super_admin: Generated<boolean>
 }
 
 export interface SessionTable {
@@ -206,6 +219,7 @@ export interface WaMessageCacheTable {
 export type TaskStatus = 'pending' | 'needs_review' | 'completed'
 export type TaskPriority = 'P1' | 'P2' | 'P3' | 'P4'
 export type TaskMessageKind = 'original' | 'reminder'
+export type TaskMessageStatus = 'sent' | 'failed'
 export type RecurrenceUnit = 'days' | 'weeks'
 
 export interface TasksTable {
@@ -213,6 +227,7 @@ export interface TasksTable {
   recipient_jid: string
   contact_id: number | null
   name: string
+  category: string | null
   priority: Generated<TaskPriority>
   // Mutually exclusive reminder modes: N times a day (1TAD/2TAD/3TAD, spread
   // across working hours), or once every N days (1IN2D/1IN3D). Neither set
@@ -239,9 +254,20 @@ export interface TasksTable {
 export interface TaskMessagesTable {
   id: Generated<number>
   task_id: number
-  wa_message_id: string
+  wa_message_id: string | null
   kind: TaskMessageKind
+  status: Generated<TaskMessageStatus>
+  error_message: string | null
   sent_at: Generated<Date>
+}
+
+export interface TaskNotesTable {
+  id: Generated<number>
+  task_id: number
+  wa_message_id: string
+  from_admin: boolean
+  body: string
+  created_at: Generated<Date>
 }
 
 export type WeekDay = 'monday' | 'tuesday' | 'wednesday' | 'thursday' | 'friday' | 'saturday' | 'sunday'
@@ -271,6 +297,7 @@ export interface TaskSettingsTable {
 }
 
 export interface Database {
+  organizations: OrganizationsTable
   users: UsersTable
   session: SessionTable
   whatsapp_connection: WhatsappConnectionTable
@@ -288,8 +315,13 @@ export interface Database {
   csv_import_rows: CsvImportRowsTable
   tasks: TasksTable
   task_messages: TaskMessagesTable
+  task_notes: TaskNotesTable
   task_settings: TaskSettingsTable
 }
+
+export type Organization = Selectable<OrganizationsTable>
+export type NewOrganization = Insertable<OrganizationsTable>
+export type OrganizationUpdate = Updateable<OrganizationsTable>
 
 export type User = Selectable<UsersTable>
 export type NewUser = Insertable<UsersTable>
@@ -338,6 +370,9 @@ export type TaskUpdate = Updateable<TasksTable>
 
 export type TaskMessage = Selectable<TaskMessagesTable>
 export type NewTaskMessage = Insertable<TaskMessagesTable>
+
+export type TaskNote = Selectable<TaskNotesTable>
+export type NewTaskNote = Insertable<TaskNotesTable>
 
 export type TaskSettings = Selectable<TaskSettingsTable>
 export type TaskSettingsUpdate = Updateable<TaskSettingsTable>

@@ -76,6 +76,7 @@ async function processRecurrence(taskId: number): Promise<void> {
       recipient_jid: original.recipient_jid,
       contact_id: original.contact_id,
       name: original.name,
+      category: original.category,
       priority: original.priority,
       reminder_times_per_day: original.reminder_times_per_day,
       reminder_interval_days: original.reminder_interval_days,

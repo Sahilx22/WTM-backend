@@ -1,14 +1,17 @@
-import { areJidsSameUser, type WASocket, type WAMessage } from '@whiskeysockets/baileys'
+import { areJidsSameUser, isJidGroup, type WASocket, type WAMessage } from '@whiskeysockets/baileys'
 import pino from 'pino'
 import { db } from '../db/index.js'
 import { isProduction } from '../config/env.js'
 import { parseCommand } from './commandParser.js'
-import { getReportData, type DateRange } from '../reports/taskMetrics.js'
+import { getReportData, STATUS_LABEL, type DateRange } from '../reports/taskMetrics.js'
 import { renderTaskReportPdf } from '../reports/taskReportPdf.js'
+import { loadReportBranding } from '../reports/branding.js'
 import { recipientDisplayName } from '../lib/recipientDisplay.js'
 import { recordAuditLog } from '../lib/auditLog.js'
 import { scheduleNextReminder, cancelTaskReminder } from '../queue/taskReminders.js'
 import { scheduleRecurrence, cancelRecurrence } from '../queue/recurringTasks.js'
+import { formatShortDate } from '../lib/dateFormat.js'
+import { resolveContactId } from './taskEngine.js'
 import type { TaskStatus, TaskPriority, RecurrenceUnit } from '../db/schema.js'
 
 const logger = pino({ level: isProduction ? 'error' : 'warn' })
@@ -19,31 +22,32 @@ const HELP_TEXT = `*WA Messenger commands*
 *View tasks*
 /status <task or employee name> — everything matching, any status
 /status <name> pending|completed|review — filtered to that status
-/status <name> from YYYY-MM-DD to YYYY-MM-DD — filtered to a date range
-(any combination of name / status / date range works together)
+/status <name> @category — filtered to a category, e.g. @acc, @pur
+/status <name> from dd-mm-yy to dd-mm-yy — filtered to a date range
+(any combination of name / status / category / date range works together)
 
 *Reports (PDF)*
 /report — all employees, all time
 /report daily|weekly|monthly — scoped to a period
 /report pending|completed|review — scoped to a status
+/report @category — scoped to a category
 /report <name or number> — one employee
-/report from YYYY-MM-DD to YYYY-MM-DD — a custom date range
-(mix and match: e.g. "/report Priya completed from 2026-08-01 to 2026-08-15")
+/report from dd-mm-yy to dd-mm-yy — a custom date range
+(mix and match: e.g. "/report Priya completed @acc from 01-08-26 to 15-08-26")
 
 *Act on a task* (get the #id from /status)
 /complete <id> — mark a task completed
-/remind <id> <N>TAD [until YYYY-MM-DD] — remind N times a day (spread across working hours; 1TAD uses the daily reminder time)
-/remind <id> 1IN<N>D [until YYYY-MM-DD] — remind once every N days
+/remind <id> <N>TAD [until dd-mm-yy] — remind N times a day (spread across working hours; 1TAD uses the daily reminder time)
+/remind <id> 1IN<N>D [until dd-mm-yy] — remind once every N days
 /remind <id> stop — turn reminders off without deleting it
 /recur <id> every <N> days|weeks [at HH:MM] — recreate this task automatically N days/weeks after it's completed
 /recur <id> off — stop it from recreating
-/priority <id> P1|P2|P3|P4 — change a task's priority (P1 = critical … P4 = low)`
+/priority <id> P1|P2|P3|P4 — change a task's priority (P1 = critical … P4 = low)
+/category <id> @tag — change a task's category, e.g. @acc, @pur
 
-const STATUS_LABEL: Record<string, string> = {
-  pending: 'Pending',
-  needs_review: 'Needs Review',
-  completed: 'Completed'
-}
+*Chat log*
+/chat <id> — everything discussed about this task (reply/quote a task or reminder message to log a note on it)
+/summary <id or task name> [dd-mm-yy] — same as /chat but also works by task name, and can be scoped to one day. Also works as a direct message from a task's own recipient straight to your number — they'll get their own task's chat log back, scoped to their own tasks only.`
 
 // Sort actionable items first: pending, then needs review, then completed.
 const STATUS_SORT_ORDER: Record<string, number> = {
@@ -57,6 +61,7 @@ async function handleStatusCommand(
   ownJid: string,
   query: string,
   statusFilter?: TaskStatus,
+  category?: string,
   dateFrom?: Date,
   dateTo?: Date
 ): Promise<void> {
@@ -67,6 +72,7 @@ async function handleStatusCommand(
     .select([
       'tasks.id',
       'tasks.name',
+      'tasks.category',
       'tasks.priority',
       'tasks.status',
       'tasks.recipient_jid',
@@ -93,6 +99,10 @@ async function handleStatusCommand(
     dbQuery = dbQuery.where('tasks.status', '=', statusFilter)
   }
 
+  if (category) {
+    dbQuery = dbQuery.where('tasks.category', '=', category)
+  }
+
   if (dateFrom) dbQuery = dbQuery.where('tasks.created_at', '>=', dateFrom)
   if (dateTo) {
     const exclusiveEnd = new Date(dateTo)
@@ -103,7 +113,9 @@ async function handleStatusCommand(
   const matches = await dbQuery.execute()
 
   if (matches.length === 0) {
-    const desc = [query && `"${query}"`, statusFilter && STATUS_LABEL[statusFilter]].filter(Boolean).join(' — ')
+    const desc = [query && `"${query}"`, statusFilter && STATUS_LABEL[statusFilter], category && `@${category}`]
+      .filter(Boolean)
+      .join(' — ')
     await sock.sendMessage(ownJid, { text: `No tasks found matching ${desc || 'that'}.` })
     return
   }
@@ -115,8 +127,9 @@ async function handleStatusCommand(
 
   const lines = matches.map((t) => {
     const who = recipientDisplayName(t.recipient_jid, t.contactName, t.groupSubject)
-    const due = t.target_date ? ` (due ${new Date(t.target_date).toISOString().slice(0, 10)})` : ''
-    return `#${t.id} [${t.priority}] *${t.name}* — ${who} — ${STATUS_LABEL[t.status] ?? t.status}${due}`
+    const due = t.target_date ? ` (due ${formatShortDate(new Date(t.target_date))})` : ''
+    const cat = t.category ? ` @${t.category}` : ''
+    return `#${t.id} [${t.priority}]${cat} *${t.name}* — ${who} — ${STATUS_LABEL[t.status] ?? t.status}${due}`
   })
 
   const summary = `${counts.pending} pending, ${counts.needs_review} in review, ${counts.completed} completed`
@@ -131,15 +144,20 @@ async function handleReportCommand(
   period: Parameters<typeof getReportData>[0],
   recipient: string | undefined,
   statusFilter: TaskStatus | undefined,
-  dateRange: DateRange
+  dateRange: DateRange,
+  category: string | undefined
 ): Promise<void> {
   try {
-    const data = await getReportData(period, recipient, statusFilter, dateRange)
-    const pdf = await renderTaskReportPdf(data)
+    const [data, branding] = await Promise.all([
+      getReportData(period, recipient, statusFilter, dateRange, category),
+      loadReportBranding()
+    ])
+    const pdf = await renderTaskReportPdf(data, branding)
     const filename = `task-report-${period}-${new Date().toISOString().slice(0, 10)}.pdf`
     const statusLabel = statusFilter ? STATUS_LABEL[statusFilter] : undefined
+    const categoryLabel = category ? `@${category}` : undefined
 
-    const captionParts = [data.periodLabel, recipient, statusLabel].filter(Boolean)
+    const captionParts = [data.periodLabel, recipient, statusLabel, categoryLabel].filter(Boolean)
     await sock.sendMessage(ownJid, {
       document: pdf,
       mimetype: 'application/pdf',
@@ -239,6 +257,135 @@ async function handlePriorityCommand(sock: WASocket, ownJid: string, taskId: num
   await sock.sendMessage(ownJid, { text: `🔥 Priority for *${task.name}* (#${taskId}) set to ${priority}.` })
 }
 
+async function handleCategoryCommand(sock: WASocket, ownJid: string, taskId: number, category: string): Promise<void> {
+  const task = await db.selectFrom('tasks').select(['name']).where('id', '=', taskId).executeTakeFirst()
+  if (!task) {
+    await sock.sendMessage(ownJid, { text: `Task #${taskId} not found.` })
+    return
+  }
+
+  await db.updateTable('tasks').set({ category, updated_at: new Date() }).where('id', '=', taskId).execute()
+
+  await sock.sendMessage(ownJid, { text: `🏷️ Category for *${task.name}* (#${taskId}) set to @${category}.` })
+}
+
+async function handleChatCommand(sock: WASocket, ownJid: string, taskId: number): Promise<void> {
+  const task = await db
+    .selectFrom('tasks')
+    .leftJoin('contacts', 'contacts.id', 'tasks.contact_id')
+    .leftJoin('groups', 'groups.wa_jid', 'tasks.recipient_jid')
+    .select(['tasks.name', 'tasks.recipient_jid', 'contacts.display_name as contactName', 'groups.subject as groupSubject'])
+    .where('tasks.id', '=', taskId)
+    .executeTakeFirst()
+
+  if (!task) {
+    await sock.sendMessage(ownJid, { text: `Task #${taskId} not found.` })
+    return
+  }
+
+  const notes = await db
+    .selectFrom('task_notes')
+    .selectAll()
+    .where('task_id', '=', taskId)
+    .orderBy('created_at', 'asc')
+    .limit(100)
+    .execute()
+
+  if (notes.length === 0) {
+    await sock.sendMessage(ownJid, {
+      text: `No chat logged for *${task.name}* (#${taskId}) yet. Reply (quote) to the task or a reminder message to log a note on it.`
+    })
+    return
+  }
+
+  const recipientLabel = recipientDisplayName(task.recipient_jid, task.contactName, task.groupSubject)
+  const lines = notes.map((n) => {
+    const who = n.from_admin ? 'You' : recipientLabel
+    const time = new Date(n.created_at).toLocaleString()
+    return `[${time}] ${who}: ${n.body}`
+  })
+
+  await sock.sendMessage(ownJid, { text: `💬 Chat log for *${task.name}* (#${taskId}):\n\n${lines.join('\n')}` })
+}
+
+// Looks up one task by #id or by a name search, then sends back its logged
+// chat (optionally scoped to a single day). `replyToJid` is where the answer
+// goes — the admin's own self-chat, or (when a task's own recipient DMs the
+// admin directly) that person's chat. `restrictToJid` is null for the admin
+// (any task) or a jid to scope the lookup to only tasks assigned to that
+// person — never let someone query another person's task chat.
+async function handleSummaryCommand(
+  sock: WASocket,
+  replyToJid: string,
+  identifier: string,
+  date: Date | undefined,
+  restrictToJid: string | null
+): Promise<void> {
+  let taskQuery = db
+    .selectFrom('tasks')
+    .leftJoin('contacts', 'contacts.id', 'tasks.contact_id')
+    .leftJoin('groups', 'groups.wa_jid', 'tasks.recipient_jid')
+    .select(['tasks.id', 'tasks.name', 'tasks.recipient_jid', 'contacts.display_name as contactName', 'groups.subject as groupSubject'])
+
+  if (restrictToJid) {
+    const contactId = await resolveContactId(sock, restrictToJid).catch(() => null)
+    taskQuery = taskQuery.where((eb) => {
+      const conditions = [eb('tasks.recipient_jid', '=', restrictToJid)]
+      if (contactId) conditions.push(eb('tasks.contact_id', '=', contactId))
+      return eb.or(conditions)
+    })
+  }
+
+  taskQuery = /^\d+$/.test(identifier.trim())
+    ? taskQuery.where('tasks.id', '=', Number(identifier.trim()))
+    : taskQuery.where('tasks.name', 'ilike', `%${identifier.trim()}%`)
+
+  const matches = await taskQuery.orderBy('tasks.created_at', 'desc').limit(6).execute()
+
+  if (matches.length === 0) {
+    await sock.sendMessage(replyToJid, { text: `No task found matching "${identifier}".` })
+    return
+  }
+
+  if (matches.length > 1) {
+    const lines = matches.map((t) => `#${t.id} ${t.name}`)
+    await sock.sendMessage(replyToJid, {
+      text: `Multiple tasks match "${identifier}" — reply with the #id instead:\n\n${lines.join('\n')}`
+    })
+    return
+  }
+
+  const task = matches[0]!
+  const dateText = date ? ` on ${formatShortDate(date)}` : ''
+
+  let notesQuery = db.selectFrom('task_notes').selectAll().where('task_id', '=', task.id).orderBy('created_at', 'asc').limit(200)
+  if (date) {
+    const dayStart = new Date(date)
+    dayStart.setHours(0, 0, 0, 0)
+    const dayEnd = new Date(dayStart)
+    dayEnd.setDate(dayEnd.getDate() + 1)
+    notesQuery = notesQuery.where('created_at', '>=', dayStart).where('created_at', '<', dayEnd)
+  }
+  const notes = await notesQuery.execute()
+
+  if (notes.length === 0) {
+    await sock.sendMessage(replyToJid, { text: `No chat logged for *${task.name}* (#${task.id})${dateText}.` })
+    return
+  }
+
+  // Label each note from the viewer's own perspective — "You" for their own
+  // messages, the other side's name/"Admin" otherwise.
+  const viewerIsAdmin = restrictToJid === null
+  const recipientLabel = recipientDisplayName(task.recipient_jid, task.contactName, task.groupSubject)
+  const lines = notes.map((n) => {
+    const who = n.from_admin ? (viewerIsAdmin ? 'You' : 'Admin') : viewerIsAdmin ? recipientLabel : 'You'
+    const time = new Date(n.created_at).toLocaleString()
+    return `[${time}] ${who}: ${n.body}`
+  })
+
+  await sock.sendMessage(replyToJid, { text: `💬 Summary for *${task.name}* (#${task.id})${dateText}:\n\n${lines.join('\n')}` })
+}
+
 async function handleRecurCommand(
   sock: WASocket,
   ownJid: string,
@@ -295,11 +442,16 @@ function isSelfChat(m: WAMessage, ownJid: string): boolean {
   return false
 }
 
-// Only ever acts on messages you send yourself, in your own self-chat — this
-// keeps report/status commands from accidentally firing in a normal
-// conversation with someone else.
+// Every command except /summary only ever acts on messages you send
+// yourself, in your own self-chat — this keeps report/status/etc commands
+// from accidentally firing in a normal conversation with someone else.
+// /summary is the one exception: it also fires as a direct message from a
+// task's own recipient straight to the admin's number (not self-chat), so
+// people can pull up their own task's chat log without needing admin
+// access — see handleSummaryCommand for how that gets scoped to their own
+// tasks only.
 export async function handleCommandMessage(sock: WASocket, ownJid: string | null, m: WAMessage): Promise<void> {
-  if (!ownJid || !m.key.fromMe || !isSelfChat(m, ownJid)) return
+  if (!ownJid || !m.key.remoteJid) return
 
   const text = m.message?.conversation ?? m.message?.extendedTextMessage?.text
   if (!text) return
@@ -307,17 +459,37 @@ export async function handleCommandMessage(sock: WASocket, ownJid: string | null
   const command = parseCommand(text)
   if (!command) return
 
+  const selfChat = Boolean(m.key.fromMe) && isSelfChat(m, ownJid)
+
+  if (command.type === 'summary') {
+    if (selfChat) {
+      await handleSummaryCommand(sock, ownJid, command.identifier, command.date, null)
+    } else if (!m.key.fromMe && !isJidGroup(m.key.remoteJid)) {
+      await handleSummaryCommand(sock, m.key.remoteJid, command.identifier, command.date, m.key.remoteJid)
+    }
+    return
+  }
+
+  if (!selfChat) return
+
   if (command.type === 'help') {
     await sock.sendMessage(ownJid, { text: HELP_TEXT })
   } else if (command.type === 'status') {
-    await handleStatusCommand(sock, ownJid, command.query, command.statusFilter, command.dateFrom, command.dateTo)
+    await handleStatusCommand(sock, ownJid, command.query, command.statusFilter, command.category, command.dateFrom, command.dateTo)
   } else if (command.type === 'report') {
-    await handleReportCommand(sock, ownJid, command.period, command.recipient, command.statusFilter, {
-      from: command.dateFrom,
-      to: command.dateTo
-    })
+    await handleReportCommand(
+      sock,
+      ownJid,
+      command.period,
+      command.recipient,
+      command.statusFilter,
+      { from: command.dateFrom, to: command.dateTo },
+      command.category
+    )
   } else if (command.type === 'complete') {
     await handleCompleteCommand(sock, ownJid, command.taskId)
+  } else if (command.type === 'chat') {
+    await handleChatCommand(sock, ownJid, command.taskId)
   } else if (command.type === 'remind') {
     await handleRemindCommand(
       sock,
@@ -338,5 +510,7 @@ export async function handleCommandMessage(sock: WASocket, ownJid: string | null
     )
   } else if (command.type === 'priority') {
     await handlePriorityCommand(sock, ownJid, command.taskId, command.priority)
+  } else if (command.type === 'category') {
+    await handleCategoryCommand(sock, ownJid, command.taskId, command.category)
   }
 }

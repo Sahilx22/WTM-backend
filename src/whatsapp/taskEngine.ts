@@ -55,10 +55,11 @@ async function createTaskFromPhoneMessage(
       recipient_jid: recipientJid,
       contact_id: contactId,
       name: parsed.name,
+      category: parsed.category,
       priority: parsed.priority,
       reminder_times_per_day: parsed.timesPerDay,
       reminder_interval_days: parsed.intervalDays,
-      target_date: parsed.targetDate ? new Date(parsed.targetDate) : null,
+      target_date: parsed.targetDate,
       status: 'pending'
     })
     .returning('id')
@@ -82,6 +83,7 @@ async function createTaskFromPhoneMessage(
     entityId: created.id,
     metadata: {
       name: parsed.name,
+      category: parsed.category,
       priority: parsed.priority,
       timesPerDay: parsed.timesPerDay,
       intervalDays: parsed.intervalDays,
@@ -89,6 +91,29 @@ async function createTaskFromPhoneMessage(
       recipientJid
     }
   })
+}
+
+// Logs a WhatsApp quote-reply as a note against whichever task the quoted
+// message (the task's original #task message, or one of its reminders)
+// belongs to. Returns true if it matched a task and was logged, so the
+// caller can skip treating the same text as anything else (e.g. a new
+// #task creation).
+async function logTaskNoteIfReply(quotedMessageId: string, waMessageId: string, fromAdmin: boolean, text: string): Promise<boolean> {
+  const taskMessage = await db
+    .selectFrom('task_messages')
+    .select('task_id')
+    .where('wa_message_id', '=', quotedMessageId)
+    .executeTakeFirst()
+
+  if (!taskMessage) return false
+
+  await db
+    .insertInto('task_notes')
+    .values({ task_id: taskMessage.task_id, wa_message_id: waMessageId, from_admin: fromAdmin, body: text })
+    .execute()
+
+  logger.info({ taskId: taskMessage.task_id, fromAdmin }, 'logged task note from WhatsApp reply')
+  return true
 }
 
 async function handleThumbsUpReaction(reactedMessageId: string): Promise<void> {
@@ -140,13 +165,22 @@ export async function handleMessageForTasks(sock: WASocket, m: WAMessage): Promi
     return
   }
 
+  const text = m.message?.conversation ?? m.message?.extendedTextMessage?.text
+  if (!text || !m.key.id) return
+
+  // A WhatsApp quote-reply to a task's original message or a reminder for it
+  // — from either the admin or the recipient — gets logged as a note on
+  // that task rather than treated as anything else (e.g. a new #task).
+  const quotedMessageId = m.message?.extendedTextMessage?.contextInfo?.stanzaId
+  if (quotedMessageId) {
+    const logged = await logTaskNoteIfReply(quotedMessageId, m.key.id, Boolean(m.key.fromMe), text)
+    if (logged) return
+  }
+
   // Only messages sent from the linked phone/app (fromMe) can create tasks —
   // this is a deliberate design choice: tasks are created by typing "#task"
   // in a normal WhatsApp chat, not through this web app's compose UI.
-  if (m.key.fromMe && m.key.remoteJid && m.key.id) {
-    const text = m.message?.conversation ?? m.message?.extendedTextMessage?.text
-    if (text) {
-      await createTaskFromPhoneMessage(sock, m.key.remoteJid, m.key.id, text)
-    }
+  if (m.key.fromMe && m.key.remoteJid) {
+    await createTaskFromPhoneMessage(sock, m.key.remoteJid, m.key.id, text)
   }
 }

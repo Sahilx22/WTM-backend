@@ -2,46 +2,40 @@ import { Router } from 'express'
 import { sql } from 'kysely'
 import { db } from '../../db/index.js'
 import { getSnapshot, maskPhoneNumber } from '../../whatsapp/connectionManager.js'
-import { getRateLimitConfig, getRollingSendCounts } from '../../queue/rateLimiter.js'
+import { getRateLimitConfig } from '../../queue/rateLimiter.js'
 
 export const dashboardRouter = Router()
 
 dashboardRouter.get('/dashboard', async (_req, res) => {
   const todayStart = sql<Date>`date_trunc('day', now())`
 
-  const [
-    sentToday,
-    deliveredToday,
-    failedToday,
-    pending,
-    totalContacts,
-    activeBatches,
-    recentActivity,
-    lastSent,
-    rateLimitConfig,
-    rollingCounts
-  ] = await Promise.all([
+  // One aggregate query covers every messages-table stat the dashboard needs
+  // (today's counts, the pending queue depth, and the rolling send-rate
+  // windows) instead of six separate round trips — each FILTER clause scans
+  // the same result set Postgres already has to read once.
+  const [messageStats, totalContacts, activeBatches, recentActivity, lastSent, rateLimitConfig] = await Promise.all([
     db
       .selectFrom('messages')
-      .select((eb) => eb.fn.countAll<number>().as('count'))
-      .where('sent_at', '>=', todayStart)
-      .executeTakeFirstOrThrow(),
-    db
-      .selectFrom('messages')
-      .select((eb) => eb.fn.countAll<number>().as('count'))
-      .where('status', 'in', ['delivered', 'read'])
-      .where('sent_at', '>=', todayStart)
-      .executeTakeFirstOrThrow(),
-    db
-      .selectFrom('messages')
-      .select((eb) => eb.fn.countAll<number>().as('count'))
-      .where('status', '=', 'failed')
-      .where('updated_at', '>=', todayStart)
-      .executeTakeFirstOrThrow(),
-    db
-      .selectFrom('messages')
-      .select((eb) => eb.fn.countAll<number>().as('count'))
-      .where('status', 'in', ['scheduled', 'queued', 'sending'])
+      .select((eb) => [
+        eb.fn.count<number>('id').filterWhere('sent_at', '>=', todayStart).as('sentToday'),
+        eb.fn
+          .count<number>('id')
+          .filterWhere((fb) => fb.and([fb('status', 'in', ['delivered', 'read']), fb('sent_at', '>=', todayStart)]))
+          .as('deliveredToday'),
+        eb.fn
+          .count<number>('id')
+          .filterWhere((fb) => fb.and([fb('status', '=', 'failed'), fb('updated_at', '>=', todayStart)]))
+          .as('failedToday'),
+        eb.fn.count<number>('id').filterWhere('status', 'in', ['scheduled', 'queued', 'sending']).as('pending'),
+        eb.fn
+          .count<number>('id')
+          .filterWhere('sent_at', '>=', sql<Date>`now() - interval '60 seconds'`)
+          .as('perMinute'),
+        eb.fn
+          .count<number>('id')
+          .filterWhere('sent_at', '>=', sql<Date>`now() - interval '1 hour'`)
+          .as('perHour')
+      ])
       .executeTakeFirstOrThrow(),
     db.selectFrom('contacts').select((eb) => eb.fn.countAll<number>().as('count')).executeTakeFirstOrThrow(),
     db
@@ -71,18 +65,17 @@ dashboardRouter.get('/dashboard', async (_req, res) => {
       .orderBy('id', 'desc')
       .limit(1)
       .executeTakeFirst(),
-    getRateLimitConfig(),
-    getRollingSendCounts()
+    getRateLimitConfig()
   ])
 
   const snapshot = getSnapshot()
 
   res.json({
     stats: {
-      sentToday: Number(sentToday.count),
-      deliveredToday: Number(deliveredToday.count),
-      failedToday: Number(failedToday.count),
-      pending: Number(pending.count),
+      sentToday: Number(messageStats.sentToday),
+      deliveredToday: Number(messageStats.deliveredToday),
+      failedToday: Number(messageStats.failedToday),
+      pending: Number(messageStats.pending),
       totalContacts: Number(totalContacts.count),
       activeBatches: Number(activeBatches.count)
     },
@@ -90,6 +83,6 @@ dashboardRouter.get('/dashboard', async (_req, res) => {
     lastSent,
     connection: { ...snapshot, maskedPhoneNumber: maskPhoneNumber(snapshot.phoneNumber) },
     rateLimitConfig,
-    rollingCounts
+    rollingCounts: { perMinute: Number(messageStats.perMinute), perHour: Number(messageStats.perHour) }
   })
 })

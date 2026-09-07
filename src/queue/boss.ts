@@ -6,8 +6,12 @@ export const QUEUE_SEND_MESSAGE = 'send-message'
 // Same SSL reasoning as db/index.ts — hosted Postgres needs it, local dev doesn't.
 const isLocalDb = /localhost|127\.0\.0\.1/.test(env.DATABASE_URL)
 
+// Small on purpose — see db/index.ts for why (shares the same hosted
+// Postgres connection cap as the main app pool).
 export const boss = new PgBoss({
+  application_name: 'wa-automation-boss',
   connectionString: env.DATABASE_URL,
+  max: 4,
   ssl: isLocalDb ? undefined : { rejectUnauthorized: false }
 })
 

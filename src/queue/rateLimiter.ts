@@ -18,19 +18,21 @@ export async function getRateLimitConfig() {
 }
 
 export async function getRollingSendCounts(): Promise<{ perMinute: number; perHour: number }> {
-  const perMinute = await db
+  const row = await db
     .selectFrom('messages')
-    .select((eb) => eb.fn.countAll<number>().as('count'))
-    .where('sent_at', '>=', sql<Date>`now() - interval '60 seconds'`)
+    .select((eb) => [
+      eb.fn
+        .count<number>('id')
+        .filterWhere('sent_at', '>=', sql<Date>`now() - interval '60 seconds'`)
+        .as('perMinute'),
+      eb.fn
+        .count<number>('id')
+        .filterWhere('sent_at', '>=', sql<Date>`now() - interval '1 hour'`)
+        .as('perHour')
+    ])
     .executeTakeFirstOrThrow()
 
-  const perHour = await db
-    .selectFrom('messages')
-    .select((eb) => eb.fn.countAll<number>().as('count'))
-    .where('sent_at', '>=', sql<Date>`now() - interval '1 hour'`)
-    .executeTakeFirstOrThrow()
-
-  return { perMinute: Number(perMinute.count), perHour: Number(perHour.count) }
+  return { perMinute: Number(row.perMinute), perHour: Number(row.perHour) }
 }
 
 export interface RateOverride {
@@ -59,19 +61,9 @@ export async function waitForSendSlot(override?: RateOverride | null): Promise<v
     const cfg = await loadConfig()
     if (cfg.is_paused) continue // dropped back into paused state while waiting for capacity
 
-    const perMinute = await db
-      .selectFrom('messages')
-      .select((eb) => eb.fn.countAll<number>().as('count'))
-      .where('sent_at', '>=', sql<Date>`now() - interval '60 seconds'`)
-      .executeTakeFirstOrThrow()
+    const { perMinute, perHour } = await getRollingSendCounts()
 
-    const perHour = await db
-      .selectFrom('messages')
-      .select((eb) => eb.fn.countAll<number>().as('count'))
-      .where('sent_at', '>=', sql<Date>`now() - interval '1 hour'`)
-      .executeTakeFirstOrThrow()
-
-    if (Number(perMinute.count) < cfg.max_per_minute && Number(perHour.count) < cfg.max_per_hour) {
+    if (perMinute < cfg.max_per_minute && perHour < cfg.max_per_hour) {
       const minDelay = Math.max(cfg.min_delay_ms, override?.minDelayMs ?? cfg.min_delay_ms)
       const maxDelay = Math.max(minDelay, Math.max(cfg.min_delay_ms, override?.maxDelayMs ?? cfg.max_delay_ms))
       const delay = randomInt(minDelay, maxDelay)

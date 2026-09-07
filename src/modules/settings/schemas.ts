@@ -53,3 +53,10 @@ export const taskSettingsSchema = z
   })
 
 export type TaskSettingsInput = z.infer<typeof taskSettingsSchema>
+
+export const brandingSchema = z.object({
+  name: z.string().min(1).max(120).optional(),
+  logo_url: z.union([z.string().url().max(2000), z.literal('')]).optional()
+})
+
+export type BrandingInput = z.infer<typeof brandingSchema>
