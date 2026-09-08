@@ -1,7 +1,7 @@
 import { db } from '../db/index.js'
 import { recipientDisplayName } from '../lib/recipientDisplay.js'
 import { formatShortDate } from '../lib/dateFormat.js'
-import type { TaskStatus } from '../db/schema.js'
+import type { TaskPriority, TaskStatus } from '../db/schema.js'
 
 export type ReportPeriod = 'daily' | 'weekly' | 'monthly' | 'all'
 
@@ -23,6 +23,19 @@ export interface ReportFilters {
   dateRange?: DateRange
 }
 
+export interface TaskDetail {
+  id: number
+  name: string
+  recipientJid: string
+  employeeName: string
+  category: string | null
+  priority: TaskPriority
+  status: TaskStatus
+  targetDate: Date | null
+  completedAt: Date | null
+  createdAt: Date
+}
+
 export interface EmployeeMetrics {
   recipientJid: string
   employeeName: string
@@ -34,6 +47,7 @@ export interface EmployeeMetrics {
   late: number
   completionPercent: number
   avgDaysToComplete: number | null
+  tasks: TaskDetail[]
 }
 
 export interface ReportData {
@@ -42,6 +56,8 @@ export interface ReportData {
   generatedAt: Date
   filters: ReportFilters
   employees: EmployeeMetrics[]
+  completedTasks: TaskDetail[]
+  remainingTasks: TaskDetail[]
   overall: {
     total: number
     completed: number
@@ -93,6 +109,10 @@ export async function getReportData(
     .leftJoin('contacts', 'contacts.id', 'tasks.contact_id')
     .leftJoin('groups', 'groups.wa_jid', 'tasks.recipient_jid')
     .select([
+      'tasks.id',
+      'tasks.name',
+      'tasks.category',
+      'tasks.priority',
       'tasks.recipient_jid',
       'tasks.status',
       'tasks.target_date',
@@ -166,9 +186,24 @@ export async function getReportData(
         ? Math.round((completedDurationsDays.reduce((a, b) => a + b, 0) / completedDurationsDays.length) * 10) / 10
         : null
 
+    const employeeName = recipientDisplayName(jid, taskRows[0]?.contactName, taskRows[0]?.groupSubject)
+    const tasks: TaskDetail[] = taskRows.map((t) => ({
+      id: t.id,
+      name: t.name,
+      recipientJid: jid,
+      employeeName,
+      category: t.category,
+      priority: t.priority,
+      status: t.status,
+      targetDate: t.target_date,
+      completedAt: t.completed_at,
+      createdAt: t.created_at
+    }))
+    tasks.sort((a, b) => a.createdAt.getTime() - b.createdAt.getTime())
+
     employees.push({
       recipientJid: jid,
-      employeeName: recipientDisplayName(jid, taskRows[0]?.contactName, taskRows[0]?.groupSubject),
+      employeeName,
       total,
       completed,
       pending,
@@ -176,11 +211,18 @@ export async function getReportData(
       onTime,
       late,
       completionPercent: total > 0 ? Math.round((completed / total) * 100) : 0,
-      avgDaysToComplete
+      avgDaysToComplete,
+      tasks
     })
   }
 
   employees.sort((a, b) => a.employeeName.localeCompare(b.employeeName))
+
+  // Flattened, per-task view (grouped by employee via the sort above) so
+  // reports can list task *names* — not just counts — split by whether
+  // they're done or still outstanding.
+  const completedTasks = employees.flatMap((e) => e.tasks.filter((t) => t.status === 'completed'))
+  const remainingTasks = employees.flatMap((e) => e.tasks.filter((t) => t.status !== 'completed'))
 
   const overallTotal = rows.length
   const overallCompleted = rows.filter((r) => r.status === 'completed').length
@@ -198,6 +240,8 @@ export async function getReportData(
       dateRange: dateRange?.from || dateRange?.to ? dateRange : undefined
     },
     employees,
+    completedTasks,
+    remainingTasks,
     overall: {
       total: overallTotal,
       completed: overallCompleted,

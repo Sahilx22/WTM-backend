@@ -1,6 +1,7 @@
 import PDFDocument from 'pdfkit'
-import { STATUS_LABEL, type ReportData } from './taskMetrics.js'
+import { STATUS_LABEL, type ReportData, type TaskDetail } from './taskMetrics.js'
 import type { ReportBranding } from './branding.js'
+import { formatShortDate } from '../lib/dateFormat.js'
 
 const INK = '#2B2620'
 const MUTED = '#746A5D'
@@ -26,6 +27,16 @@ const COLUMNS = [
   { key: 'avgDaysToComplete', label: 'Avg days', width: 60, align: 'right' as const }
 ] as const
 
+const TASK_COLUMNS = [
+  { key: 'name', label: 'Task', width: 230, align: 'left' as const },
+  { key: 'employeeName', label: 'Employee', width: 140, align: 'left' as const },
+  { key: 'category', label: 'Category', width: 70, align: 'left' as const },
+  { key: 'priority', label: 'Priority', width: 55, align: 'left' as const },
+  { key: 'status', label: 'Status', width: 80, align: 'left' as const },
+  { key: 'due', label: 'Due', width: 55, align: 'right' as const },
+  { key: 'completedOn', label: 'Completed', width: 65, align: 'right' as const }
+] as const
+
 function formatFilterLine(data: ReportData): string {
   const parts: string[] = [data.periodLabel]
   if (data.filters.status) parts.push(`Status: ${STATUS_LABEL[data.filters.status]}`)
@@ -45,6 +56,12 @@ export function renderTaskReportPdf(data: ReportData, branding: ReportBranding =
     const startX = doc.page.margins.left
     const pageWidth = doc.page.width - doc.page.margins.left - doc.page.margins.right
     const tableWidth = COLUMNS.reduce((sum, c) => sum + c.width, 0)
+    const taskTableWidth = TASK_COLUMNS.reduce((sum, c) => sum + c.width, 0)
+    const rowHeight = 20
+
+    function formatDetailDate(d: Date | null): string {
+      return d ? formatShortDate(d) : '—'
+    }
 
     // --- Page 1 masthead: logo + company name + report title + filters ---
     let y = doc.page.margins.top
@@ -134,7 +151,6 @@ export function renderTaskReportPdf(data: ReportData, branding: ReportBranding =
 
     y = drawTableHeader(y)
 
-    const rowHeight = 20
     let rowIndex = 0
 
     for (const emp of data.employees) {
@@ -222,6 +238,82 @@ export function renderTaskReportPdf(data: ReportData, branding: ReportBranding =
       }
       y += rowHeight
     }
+
+    // --- Task details: every task by name, split by done vs still outstanding ---
+    function drawTaskTableHeader(atY: number): number {
+      doc.rect(startX, atY, taskTableWidth, 20).fillColor(HEADER_FILL).fill()
+      let x = startX
+      doc.fontSize(8.5).font('Helvetica-Bold').fillColor(MUTED)
+      for (const col of TASK_COLUMNS) {
+        doc.text(col.label, x + 6, atY + 6, { width: col.width - 10, height: 14, align: col.align, ellipsis: true })
+        x += col.width
+      }
+      return atY + 20
+    }
+
+    function drawTaskSection(title: string, tasks: TaskDetail[]): void {
+      if (y + 40 > doc.page.height - doc.page.margins.bottom - 40) {
+        doc.addPage()
+        y = drawRunningHeader()
+      }
+
+      doc.fontSize(11).fillColor(INK).font('Helvetica-Bold').text(`${title} (${tasks.length})`, startX, y)
+      y = doc.y + 8
+
+      if (tasks.length === 0) {
+        doc.fontSize(9).fillColor(FAINT).font('Helvetica').text('None.', startX, y)
+        y += 22
+        return
+      }
+
+      y = drawTaskTableHeader(y)
+
+      let idx = 0
+      for (const task of tasks) {
+        if (y + rowHeight > doc.page.height - doc.page.margins.bottom - 40) {
+          doc.addPage()
+          y = drawRunningHeader()
+          y = drawTaskTableHeader(y)
+          idx = 0
+        }
+
+        if (idx % 2 === 1) {
+          doc.rect(startX, y, taskTableWidth, rowHeight).fillColor(STRIPE_FILL).fill()
+        }
+
+        const cells: Record<(typeof TASK_COLUMNS)[number]['key'], string> = {
+          name: task.name,
+          employeeName: task.employeeName,
+          category: task.category ? `@${task.category}` : '—',
+          priority: task.priority,
+          status: STATUS_LABEL[task.status],
+          due: formatDetailDate(task.targetDate),
+          completedOn: formatDetailDate(task.completedAt)
+        }
+
+        let x = startX
+        doc.fontSize(9).font('Helvetica').fillColor(INK)
+        for (const col of TASK_COLUMNS) {
+          doc.text(cells[col.key], x + 6, y + 5, { width: col.width - 10, height: rowHeight - 8, align: col.align, ellipsis: true })
+          x += col.width
+        }
+
+        doc
+          .moveTo(startX, y + rowHeight)
+          .lineTo(startX + taskTableWidth, y + rowHeight)
+          .strokeColor(BORDER)
+          .lineWidth(0.5)
+          .stroke()
+
+        y += rowHeight
+        idx++
+      }
+
+      y += 18
+    }
+
+    drawTaskSection('Completed tasks', data.completedTasks)
+    drawTaskSection('Remaining tasks', data.remainingTasks)
 
     // --- Footer: page numbers on every page ---
     const pageRange = doc.bufferedPageRange()
