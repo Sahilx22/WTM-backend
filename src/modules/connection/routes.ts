@@ -2,26 +2,33 @@ import { Router } from 'express'
 import { db } from '../../db/index.js'
 import {
   connectionEvents,
-  getSnapshot,
+  createSession,
+  deleteSession,
+  getMaxSessions,
+  getPrimarySocket,
+  listSessionsForOrganization,
   maskPhoneNumber,
   requestConnect,
   requestLogout,
-  type ConnectionSnapshot
+  type SessionSnapshot
 } from '../../whatsapp/connectionManager.js'
 import type { ConnectionStatus } from '../../db/schema.js'
 
 export const connectionRouter = Router()
 
 const STATUS_PRESENTATION: Record<ConnectionStatus, { label: string; tone: string }> = {
-  connected: { label: 'WhatsApp connected', tone: 'success' },
+  connected: { label: 'Connected', tone: 'success' },
   connecting: { label: 'Connecting…', tone: 'warning' },
   qr_pending: { label: 'Scan QR to connect', tone: 'warning' },
-  disconnected: { label: 'WhatsApp disconnected', tone: 'danger' }
+  disconnected: { label: 'Disconnected', tone: 'danger' }
 }
 
-function statusPayload(snapshot: ConnectionSnapshot) {
+function sessionPayload(snapshot: SessionSnapshot) {
   const presentation = STATUS_PRESENTATION[snapshot.status]
   return {
+    id: snapshot.sessionId,
+    label: snapshot.label,
+    isPrimary: snapshot.isPrimary,
     status: snapshot.status,
     statusLabel: presentation.label,
     statusTone: presentation.tone,
@@ -31,25 +38,53 @@ function statusPayload(snapshot: ConnectionSnapshot) {
   }
 }
 
-connectionRouter.get('/connection/badge', async (_req, res) => {
+// A session belongs to req.user's own organization — never let one org
+// connect/disconnect/remove another org's session.
+async function requireOwnSession(organizationId: number, sessionId: number): Promise<boolean> {
   const row = await db
-    .selectFrom('whatsapp_connection')
-    .select(['status'])
-    .where('id', '=', 1)
+    .selectFrom('whatsapp_sessions')
+    .select('id')
+    .where('id', '=', sessionId)
+    .where('organization_id', '=', organizationId)
     .executeTakeFirst()
+  return Boolean(row)
+}
 
-  const snapshot = getSnapshot()
-  const liveStatus = snapshot.status
-  const status = liveStatus ?? row?.status ?? 'disconnected'
+// Small always-visible indicator (sidebar): reflects whether *some* session
+// for this org is connected — the primary if there is one, otherwise
+// whichever session has the most "active" status.
+connectionRouter.get('/connection/badge', async (req, res) => {
+  const organizationId = req.user?.organizationId
+  if (!organizationId) {
+    res.json({ status: { status: 'disconnected', statusLabel: 'No sessions', statusTone: 'neutral', qrDataUrl: null, maskedPhoneNumber: null, lastDisconnectReason: null } })
+    return
+  }
 
-  res.json({ status: statusPayload({ ...snapshot, status }) })
+  const sessions = await listSessionsForOrganization(organizationId)
+  const primary = sessions.find((s) => s.isPrimary) ?? sessions[0]
+
+  if (!primary) {
+    res.json({ status: { status: 'disconnected', statusLabel: 'No sessions yet', statusTone: 'neutral', qrDataUrl: null, maskedPhoneNumber: null, lastDisconnectReason: null } })
+    return
+  }
+
+  res.json({ status: sessionPayload(primary) })
 })
 
-connectionRouter.get('/connection', (_req, res) => {
-  res.json({ status: statusPayload(getSnapshot()) })
+connectionRouter.get('/connection/sessions', async (req, res) => {
+  const organizationId = req.user?.organizationId
+  if (!organizationId) {
+    res.json({ sessions: [], maxSessions: 0 })
+    return
+  }
+
+  const [sessions, maxSessions] = await Promise.all([listSessionsForOrganization(organizationId), getMaxSessions(organizationId)])
+  res.json({ sessions: sessions.map(sessionPayload), maxSessions })
 })
 
-connectionRouter.get('/connection/stream', (req, res) => {
+connectionRouter.get('/connection/sessions/stream', (req, res) => {
+  const organizationId = req.user?.organizationId
+
   res.set({
     'Content-Type': 'text/event-stream',
     'Cache-Control': 'no-cache',
@@ -57,13 +92,17 @@ connectionRouter.get('/connection/stream', (req, res) => {
   })
   res.flushHeaders()
 
-  const send = (snapshot: ConnectionSnapshot) => {
-    res.write(`event: message\ndata: ${JSON.stringify(statusPayload(snapshot))}\n\n`)
+  const send = async () => {
+    if (!organizationId) return
+    const sessions = await listSessionsForOrganization(organizationId)
+    res.write(`event: message\ndata: ${JSON.stringify(sessions.map(sessionPayload))}\n\n`)
   }
 
-  send(getSnapshot())
+  void send()
 
-  const listener = (snapshot: ConnectionSnapshot) => send(snapshot)
+  const listener = (snapshot: SessionSnapshot) => {
+    if (snapshot.organizationId === organizationId) void send()
+  }
   connectionEvents.on('update', listener)
 
   const heartbeat = setInterval(() => res.write(': heartbeat\n\n'), 20000)
@@ -74,12 +113,73 @@ connectionRouter.get('/connection/stream', (req, res) => {
   })
 })
 
-connectionRouter.post('/connection/connect', async (_req, res) => {
-  await requestConnect()
-  res.json({ status: statusPayload(getSnapshot()) })
+connectionRouter.post('/connection/sessions', async (req, res) => {
+  const organizationId = req.user?.organizationId
+  if (!organizationId) {
+    res.status(403).json({ error: 'No organization to add a session to.' })
+    return
+  }
+
+  const label = typeof req.body?.label === 'string' ? req.body.label : undefined
+
+  try {
+    const snapshot = await createSession(organizationId, label)
+    await requestConnect(snapshot.sessionId)
+    res.status(201).json({ session: sessionPayload(snapshot) })
+  } catch (err) {
+    res.status(409).json({ error: err instanceof Error ? err.message : 'Could not create a new session.' })
+  }
 })
 
-connectionRouter.post('/connection/logout', async (req, res) => {
-  await requestLogout(req.user?.id ?? null)
-  res.json({ status: statusPayload(getSnapshot()) })
+connectionRouter.post('/connection/sessions/:id/connect', async (req, res) => {
+  const organizationId = req.user?.organizationId
+  const sessionId = Number(req.params.id)
+
+  if (!organizationId || !(await requireOwnSession(organizationId, sessionId))) {
+    res.status(404).json({ error: 'Session not found.' })
+    return
+  }
+
+  await requestConnect(sessionId)
+  const sessions = await listSessionsForOrganization(organizationId)
+  const updated = sessions.find((s) => s.sessionId === sessionId)
+  res.json({ session: updated ? sessionPayload(updated) : null })
+})
+
+connectionRouter.post('/connection/sessions/:id/logout', async (req, res) => {
+  const organizationId = req.user?.organizationId
+  const sessionId = Number(req.params.id)
+
+  if (!organizationId || !(await requireOwnSession(organizationId, sessionId))) {
+    res.status(404).json({ error: 'Session not found.' })
+    return
+  }
+
+  await requestLogout(sessionId, req.user?.id ?? null)
+  const sessions = await listSessionsForOrganization(organizationId)
+  const updated = sessions.find((s) => s.sessionId === sessionId)
+  res.json({ session: updated ? sessionPayload(updated) : null })
+})
+
+connectionRouter.delete('/connection/sessions/:id', async (req, res) => {
+  const organizationId = req.user?.organizationId
+  const sessionId = Number(req.params.id)
+
+  if (!organizationId || !(await requireOwnSession(organizationId, sessionId))) {
+    res.status(404).json({ error: 'Session not found.' })
+    return
+  }
+
+  try {
+    await deleteSession(sessionId)
+    res.status(204).end()
+  } catch (err) {
+    res.status(409).json({ error: err instanceof Error ? err.message : 'Could not remove this session.' })
+  }
+})
+
+// Diagnostic only — confirms whether *any* organization currently has a
+// connected primary session (the one reminders/auto-reports go through).
+connectionRouter.get('/connection/primary-status', (_req, res) => {
+  res.json({ connected: getPrimarySocket() !== null })
 })

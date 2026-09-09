@@ -13,7 +13,7 @@ const STRIPE_FILL = '#FAF8F4'
 const SUCCESS = '#3F7A58'
 const WARNING = '#A97A2B'
 
-const DEFAULT_BRANDING: ReportBranding = { companyName: 'WhatsApp Task Report', logoBuffer: null }
+const DEFAULT_BRANDING: ReportBranding = { companyName: 'WhatsApp Task Report', logoBuffer: null, adminWaNumber: null }
 
 const COLUMNS = [
   { key: 'employeeName', label: 'Employee', width: 165, align: 'left' as const },
@@ -28,13 +28,14 @@ const COLUMNS = [
 ] as const
 
 const TASK_COLUMNS = [
-  { key: 'name', label: 'Task', width: 230, align: 'left' as const },
-  { key: 'employeeName', label: 'Employee', width: 140, align: 'left' as const },
-  { key: 'category', label: 'Category', width: 70, align: 'left' as const },
-  { key: 'priority', label: 'Priority', width: 55, align: 'left' as const },
-  { key: 'status', label: 'Status', width: 80, align: 'left' as const },
-  { key: 'due', label: 'Due', width: 55, align: 'right' as const },
-  { key: 'completedOn', label: 'Completed', width: 65, align: 'right' as const }
+  { key: 'name', label: 'Task', width: 210, align: 'left' as const },
+  { key: 'employeeName', label: 'Employee', width: 125, align: 'left' as const },
+  { key: 'category', label: 'Category', width: 60, align: 'left' as const },
+  { key: 'priority', label: 'Priority', width: 50, align: 'left' as const },
+  { key: 'status', label: 'Status', width: 75, align: 'left' as const },
+  { key: 'due', label: 'Due', width: 50, align: 'right' as const },
+  { key: 'completedOn', label: 'Completed', width: 55, align: 'right' as const },
+  { key: 'delegatedBy', label: 'Delegated by', width: 90, align: 'left' as const }
 ] as const
 
 function formatFilterLine(data: ReportData): string {
@@ -80,7 +81,8 @@ export function renderTaskReportPdf(data: ReportData, branding: ReportBranding =
     }
 
     doc.fontSize(15).fillColor(INK).font('Helvetica-Bold').text(branding.companyName, textX, y, { width: pageWidth - (textX - startX) })
-    doc.fontSize(9).fillColor(MUTED).font('Helvetica').text('Task Report', textX, doc.y)
+    const subtitle = branding.adminWaNumber ? `Task Report · ${branding.adminWaNumber}` : 'Task Report'
+    doc.fontSize(9).fillColor(MUTED).font('Helvetica').text(subtitle, textX, doc.y)
 
     y = Math.max(y + logoSize, doc.y) + 12
     doc
@@ -288,7 +290,8 @@ export function renderTaskReportPdf(data: ReportData, branding: ReportBranding =
           priority: task.priority,
           status: STATUS_LABEL[task.status],
           due: formatDetailDate(task.targetDate),
-          completedOn: formatDetailDate(task.completedAt)
+          completedOn: formatDetailDate(task.completedAt),
+          delegatedBy: task.createdByLabel ?? '—'
         }
 
         let x = startX

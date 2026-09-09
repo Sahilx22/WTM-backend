@@ -2,7 +2,7 @@ import type { Job } from 'pg-boss'
 import pino from 'pino'
 import { boss } from './boss.js'
 import { db } from '../db/index.js'
-import { getSocket, getSnapshot } from '../whatsapp/connectionManager.js'
+import { getPrimarySocket, getPrimarySnapshot } from '../whatsapp/connectionManager.js'
 import { recipientDisplayName } from '../lib/recipientDisplay.js'
 import { SERVER_TZ, WEEKDAY_NUMBERS, cronFromTime } from './autoReports.js'
 import { isProduction } from '../config/env.js'
@@ -48,9 +48,8 @@ export async function applyDigestSchedules(settings: TaskSettings): Promise<void
 }
 
 async function sendDailyOverview(): Promise<void> {
-  const sock = getSocket()
-  const snapshot = getSnapshot()
-  if (!sock || snapshot.status !== 'connected') {
+  const sock = getPrimarySocket()
+  if (!sock) {
     logger.warn('skipped daily overview — WhatsApp not connected')
     return
   }
@@ -86,9 +85,8 @@ function startOfWeek(date: Date): Date {
 }
 
 async function sendWeeklyReport(): Promise<void> {
-  const sock = getSocket()
-  const snapshot = getSnapshot()
-  if (!sock || snapshot.status !== 'connected') {
+  const sock = getPrimarySocket()
+  if (!sock) {
     logger.warn('skipped weekly report — WhatsApp not connected')
     return
   }
@@ -127,9 +125,9 @@ async function sendWeeklyReport(): Promise<void> {
 }
 
 async function sendReviewDigest(): Promise<void> {
-  const sock = getSocket()
-  const snapshot = getSnapshot()
-  if (!sock || snapshot.status !== 'connected' || !snapshot.waJid) {
+  const sock = getPrimarySocket()
+  const snapshot = getPrimarySnapshot()
+  if (!sock || !snapshot?.waJid) {
     logger.warn('skipped review digest — WhatsApp not connected')
     return
   }

@@ -2,7 +2,7 @@ import './config/paths.js'
 import { env } from './config/env.js'
 import { app } from './app.js'
 import { pool } from './db/index.js'
-import { requestConnect } from './whatsapp/connectionManager.js'
+import { bootAllSessions } from './whatsapp/connectionManager.js'
 import { boss, startBoss } from './queue/boss.js'
 import { startOutgoingWorker } from './queue/outgoingWorker.js'
 import { getRateLimitConfig } from './queue/rateLimiter.js'
@@ -58,10 +58,10 @@ async function shutdown(signal: string): Promise<void> {
 process.on('SIGTERM', () => void shutdown('SIGTERM'))
 process.on('SIGINT', () => void shutdown('SIGINT'))
 
-// Attempt to (re)establish the shared WhatsApp connection on boot. If no
-// session was ever linked, this just brings the socket up to qr_pending.
-void requestConnect().catch((err) => {
-  console.error('Initial WhatsApp connection attempt failed:', err)
+// Resume every organization's previously-created WhatsApp session(s) on
+// boot. A session with no saved creds yet just comes up at qr_pending.
+void bootAllSessions().catch((err) => {
+  console.error('Initial WhatsApp session bootstrap failed:', err)
 })
 
 void startBoss()

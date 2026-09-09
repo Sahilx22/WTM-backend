@@ -8,9 +8,13 @@ import fs from 'node:fs'
 // level that the dev (tsx-on-src) path never had.
 export const ROOT_DIR = process.cwd()
 export const DATA_DIR = path.join(ROOT_DIR, 'data')
+// Legacy single-connection auth dir — unused now that each WhatsApp session
+// gets its own subdirectory under AUTH_SESSIONS_DIR, kept only so old data
+// isn't orphaned without explanation.
 export const AUTH_DIR = path.join(DATA_DIR, 'auth_info_baileys')
+export const AUTH_SESSIONS_DIR = path.join(DATA_DIR, 'auth_sessions')
 export const CSV_IMPORT_DIR = path.join(DATA_DIR, 'csv-imports')
 
-for (const dir of [DATA_DIR, AUTH_DIR, CSV_IMPORT_DIR]) {
+for (const dir of [DATA_DIR, AUTH_DIR, AUTH_SESSIONS_DIR, CSV_IMPORT_DIR]) {
   fs.mkdirSync(dir, { recursive: true })
 }

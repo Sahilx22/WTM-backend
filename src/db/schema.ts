@@ -30,6 +30,26 @@ export interface OrganizationsTable {
   logo_url: string | null
   admin_wa_number: string | null
   is_active: Generated<boolean>
+  // How many concurrent WhatsApp sessions (see WhatsappSessionsTable) this
+  // org's admin can connect at once. Set by the super admin.
+  max_sessions: Generated<number>
+  created_at: Generated<Date>
+  updated_at: Generated<Date>
+}
+
+export interface WhatsappSessionsTable {
+  id: Generated<number>
+  organization_id: number
+  label: string | null
+  status: Generated<ConnectionStatus>
+  phone_number: string | null
+  wa_jid: string | null
+  // The org's first-ever connected session; reminders/auto-reports always
+  // send through whichever session has this set, regardless of which
+  // session created the underlying task.
+  is_primary: Generated<boolean>
+  connected_at: Date | null
+  last_disconnect_reason: string | null
   created_at: Generated<Date>
   updated_at: Generated<Date>
 }
@@ -249,6 +269,13 @@ export interface TasksTable {
   recurrence_time: string | null
   recurrence_parent_id: number | null
   next_recurrence_job_id: string | null
+  // Which session's #task message created this task — null for tasks
+  // created before multi-session support, or if that session was deleted.
+  created_by_session_id: number | null
+  // Which organization this task belongs to — every task query filters by
+  // it so one organization's sessions never see another's tasks. Null only
+  // for pre-multi-tenant tasks that couldn't be backfilled.
+  organization_id: number | null
 }
 
 export interface TaskMessagesTable {
@@ -301,6 +328,7 @@ export interface Database {
   users: UsersTable
   session: SessionTable
   whatsapp_connection: WhatsappConnectionTable
+  whatsapp_sessions: WhatsappSessionsTable
   wa_message_cache: WaMessageCacheTable
   contacts: ContactsTable
   groups: GroupsTable
@@ -322,6 +350,10 @@ export interface Database {
 export type Organization = Selectable<OrganizationsTable>
 export type NewOrganization = Insertable<OrganizationsTable>
 export type OrganizationUpdate = Updateable<OrganizationsTable>
+
+export type WhatsappSession = Selectable<WhatsappSessionsTable>
+export type NewWhatsappSession = Insertable<WhatsappSessionsTable>
+export type WhatsappSessionUpdate = Updateable<WhatsappSessionsTable>
 
 export type User = Selectable<UsersTable>
 export type NewUser = Insertable<UsersTable>

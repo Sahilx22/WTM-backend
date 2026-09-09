@@ -34,6 +34,9 @@ export interface TaskDetail {
   targetDate: Date | null
   completedAt: Date | null
   createdAt: Date
+  // Which session/employee delegated this task — null for tasks created
+  // before multi-session support, or whose creating session was removed.
+  createdByLabel: string | null
 }
 
 export interface EmployeeMetrics {
@@ -102,12 +105,18 @@ export async function getReportData(
   recipientFilter?: string,
   statusFilter?: TaskStatus,
   dateRange?: DateRange,
-  category?: string
+  category?: string,
+  // Every caller with a concrete organization (a WhatsApp session always
+  // has one; a logged-in org user does too) must pass this — omitting it
+  // returns every organization's tasks, which only the super admin's
+  // cross-org views should ever do.
+  organizationId?: number
 ): Promise<ReportData> {
   let query = db
     .selectFrom('tasks')
     .leftJoin('contacts', 'contacts.id', 'tasks.contact_id')
     .leftJoin('groups', 'groups.wa_jid', 'tasks.recipient_jid')
+    .leftJoin('whatsapp_sessions', 'whatsapp_sessions.id', 'tasks.created_by_session_id')
     .select([
       'tasks.id',
       'tasks.name',
@@ -119,8 +128,14 @@ export async function getReportData(
       'tasks.completed_at',
       'tasks.created_at',
       'contacts.display_name as contactName',
-      'groups.subject as groupSubject'
+      'groups.subject as groupSubject',
+      'whatsapp_sessions.label as createdBySessionLabel',
+      'whatsapp_sessions.phone_number as createdBySessionPhone'
     ])
+
+  if (organizationId !== undefined) {
+    query = query.where('tasks.organization_id', '=', organizationId)
+  }
 
   // An explicit date range (from a chat command like "/report from ... to
   // ...") always wins over the coarse period bucket — otherwise fall back to
@@ -197,7 +212,8 @@ export async function getReportData(
       status: t.status,
       targetDate: t.target_date,
       completedAt: t.completed_at,
-      createdAt: t.created_at
+      createdAt: t.created_at,
+      createdByLabel: t.createdBySessionLabel ?? t.createdBySessionPhone ?? null
     }))
     tasks.sort((a, b) => a.createdAt.getTime() - b.createdAt.getTime())
 

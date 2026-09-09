@@ -38,7 +38,7 @@ organizationsRouter.post('/organizations', requireSuperAdmin, async (req, res) =
     return
   }
 
-  const { name, admin_wa_number, username, password, display_name } = parsed.data
+  const { name, admin_wa_number, max_sessions, username, password, display_name } = parsed.data
 
   const existing = await db.selectFrom('users').select('id').where('username', '=', username).executeTakeFirst()
   if (existing) {
@@ -51,7 +51,7 @@ organizationsRouter.post('/organizations', requireSuperAdmin, async (req, res) =
   const result = await db.transaction().execute(async (trx) => {
     const organization = await trx
       .insertInto('organizations')
-      .values({ name, admin_wa_number: admin_wa_number ?? null })
+      .values({ name, admin_wa_number: admin_wa_number ?? null, max_sessions: max_sessions ?? 1 })
       .returningAll()
       .executeTakeFirstOrThrow()
 

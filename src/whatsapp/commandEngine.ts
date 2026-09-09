@@ -59,6 +59,7 @@ const STATUS_SORT_ORDER: Record<string, number> = {
 async function handleStatusCommand(
   sock: WASocket,
   ownJid: string,
+  organizationId: number,
   query: string,
   statusFilter?: TaskStatus,
   category?: string,
@@ -69,6 +70,7 @@ async function handleStatusCommand(
     .selectFrom('tasks')
     .leftJoin('contacts', 'contacts.id', 'tasks.contact_id')
     .leftJoin('groups', 'groups.wa_jid', 'tasks.recipient_jid')
+    .leftJoin('whatsapp_sessions', 'whatsapp_sessions.id', 'tasks.created_by_session_id')
     .select([
       'tasks.id',
       'tasks.name',
@@ -78,8 +80,12 @@ async function handleStatusCommand(
       'tasks.recipient_jid',
       'tasks.target_date',
       'contacts.display_name as contactName',
-      'groups.subject as groupSubject'
+      'groups.subject as groupSubject',
+      'whatsapp_sessions.label as createdBySessionLabel',
+      'whatsapp_sessions.phone_number as createdBySessionPhone',
+      'whatsapp_sessions.is_primary as createdBySessionIsPrimary'
     ])
+    .where('tasks.organization_id', '=', organizationId)
     .orderBy('tasks.created_at', 'desc')
     .limit(30)
 
@@ -129,7 +135,12 @@ async function handleStatusCommand(
     const who = recipientDisplayName(t.recipient_jid, t.contactName, t.groupSubject)
     const due = t.target_date ? ` (due ${formatShortDate(new Date(t.target_date))})` : ''
     const cat = t.category ? ` @${t.category}` : ''
-    return `#${t.id} [${t.priority}]${cat} *${t.name}* — ${who} — ${STATUS_LABEL[t.status] ?? t.status}${due}`
+    // Only call out the creator for tasks a delegator session created —
+    // tasks from the admin's own (primary) session are the default, so
+    // stating it every time would just be noise.
+    const delegatedBy =
+      t.createdBySessionIsPrimary === false ? ` [via ${t.createdBySessionLabel ?? t.createdBySessionPhone ?? 'delegated session'}]` : ''
+    return `#${t.id} [${t.priority}]${cat} *${t.name}* — ${who} — ${STATUS_LABEL[t.status] ?? t.status}${due}${delegatedBy}`
   })
 
   const summary = `${counts.pending} pending, ${counts.needs_review} in review, ${counts.completed} completed`
@@ -141,6 +152,7 @@ async function handleStatusCommand(
 async function handleReportCommand(
   sock: WASocket,
   ownJid: string,
+  organizationId: number,
   period: Parameters<typeof getReportData>[0],
   recipient: string | undefined,
   statusFilter: TaskStatus | undefined,
@@ -149,8 +161,8 @@ async function handleReportCommand(
 ): Promise<void> {
   try {
     const [data, branding] = await Promise.all([
-      getReportData(period, recipient, statusFilter, dateRange, category),
-      loadReportBranding()
+      getReportData(period, recipient, statusFilter, dateRange, category, organizationId),
+      loadReportBranding(organizationId)
     ])
     const pdf = await renderTaskReportPdf(data, branding)
     const filename = `task-report-${period}-${new Date().toISOString().slice(0, 10)}.pdf`
@@ -170,8 +182,13 @@ async function handleReportCommand(
   }
 }
 
-async function handleCompleteCommand(sock: WASocket, ownJid: string, taskId: number): Promise<void> {
-  const task = await db.selectFrom('tasks').selectAll().where('id', '=', taskId).executeTakeFirst()
+async function handleCompleteCommand(sock: WASocket, ownJid: string, organizationId: number, taskId: number): Promise<void> {
+  const task = await db
+    .selectFrom('tasks')
+    .selectAll()
+    .where('id', '=', taskId)
+    .where('organization_id', '=', organizationId)
+    .executeTakeFirst()
   if (!task) {
     await sock.sendMessage(ownJid, { text: `Task #${taskId} not found.` })
     return
@@ -204,10 +221,16 @@ async function handleCompleteCommand(sock: WASocket, ownJid: string, taskId: num
 async function handleRemindCommand(
   sock: WASocket,
   ownJid: string,
+  organizationId: number,
   taskId: number,
   update: { stop: true } | { stop: false; timesPerDay: number | null; intervalDays: number | null; targetDate?: Date }
 ): Promise<void> {
-  const task = await db.selectFrom('tasks').selectAll().where('id', '=', taskId).executeTakeFirst()
+  const task = await db
+    .selectFrom('tasks')
+    .selectAll()
+    .where('id', '=', taskId)
+    .where('organization_id', '=', organizationId)
+    .executeTakeFirst()
   if (!task) {
     await sock.sendMessage(ownJid, { text: `Task #${taskId} not found.` })
     return
@@ -245,8 +268,19 @@ async function handleRemindCommand(
   await sock.sendMessage(ownJid, { text: `⏰ Reminder for *${task.name}* (#${taskId}) set to ${cadenceText}.` })
 }
 
-async function handlePriorityCommand(sock: WASocket, ownJid: string, taskId: number, priority: TaskPriority): Promise<void> {
-  const task = await db.selectFrom('tasks').select(['name']).where('id', '=', taskId).executeTakeFirst()
+async function handlePriorityCommand(
+  sock: WASocket,
+  ownJid: string,
+  organizationId: number,
+  taskId: number,
+  priority: TaskPriority
+): Promise<void> {
+  const task = await db
+    .selectFrom('tasks')
+    .select(['name'])
+    .where('id', '=', taskId)
+    .where('organization_id', '=', organizationId)
+    .executeTakeFirst()
   if (!task) {
     await sock.sendMessage(ownJid, { text: `Task #${taskId} not found.` })
     return
@@ -257,8 +291,19 @@ async function handlePriorityCommand(sock: WASocket, ownJid: string, taskId: num
   await sock.sendMessage(ownJid, { text: `🔥 Priority for *${task.name}* (#${taskId}) set to ${priority}.` })
 }
 
-async function handleCategoryCommand(sock: WASocket, ownJid: string, taskId: number, category: string): Promise<void> {
-  const task = await db.selectFrom('tasks').select(['name']).where('id', '=', taskId).executeTakeFirst()
+async function handleCategoryCommand(
+  sock: WASocket,
+  ownJid: string,
+  organizationId: number,
+  taskId: number,
+  category: string
+): Promise<void> {
+  const task = await db
+    .selectFrom('tasks')
+    .select(['name'])
+    .where('id', '=', taskId)
+    .where('organization_id', '=', organizationId)
+    .executeTakeFirst()
   if (!task) {
     await sock.sendMessage(ownJid, { text: `Task #${taskId} not found.` })
     return
@@ -269,13 +314,14 @@ async function handleCategoryCommand(sock: WASocket, ownJid: string, taskId: num
   await sock.sendMessage(ownJid, { text: `🏷️ Category for *${task.name}* (#${taskId}) set to @${category}.` })
 }
 
-async function handleChatCommand(sock: WASocket, ownJid: string, taskId: number): Promise<void> {
+async function handleChatCommand(sock: WASocket, ownJid: string, organizationId: number, taskId: number): Promise<void> {
   const task = await db
     .selectFrom('tasks')
     .leftJoin('contacts', 'contacts.id', 'tasks.contact_id')
     .leftJoin('groups', 'groups.wa_jid', 'tasks.recipient_jid')
     .select(['tasks.name', 'tasks.recipient_jid', 'contacts.display_name as contactName', 'groups.subject as groupSubject'])
     .where('tasks.id', '=', taskId)
+    .where('tasks.organization_id', '=', organizationId)
     .executeTakeFirst()
 
   if (!task) {
@@ -317,6 +363,7 @@ async function handleChatCommand(sock: WASocket, ownJid: string, taskId: number)
 async function handleSummaryCommand(
   sock: WASocket,
   replyToJid: string,
+  organizationId: number,
   identifier: string,
   date: Date | undefined,
   restrictToJid: string | null
@@ -326,6 +373,7 @@ async function handleSummaryCommand(
     .leftJoin('contacts', 'contacts.id', 'tasks.contact_id')
     .leftJoin('groups', 'groups.wa_jid', 'tasks.recipient_jid')
     .select(['tasks.id', 'tasks.name', 'tasks.recipient_jid', 'contacts.display_name as contactName', 'groups.subject as groupSubject'])
+    .where('tasks.organization_id', '=', organizationId)
 
   if (restrictToJid) {
     const contactId = await resolveContactId(sock, restrictToJid).catch(() => null)
@@ -389,10 +437,16 @@ async function handleSummaryCommand(
 async function handleRecurCommand(
   sock: WASocket,
   ownJid: string,
+  organizationId: number,
   taskId: number,
   update: { off: true } | { off: false; intervalValue: number; intervalUnit: RecurrenceUnit; time?: string }
 ): Promise<void> {
-  const task = await db.selectFrom('tasks').selectAll().where('id', '=', taskId).executeTakeFirst()
+  const task = await db
+    .selectFrom('tasks')
+    .selectAll()
+    .where('id', '=', taskId)
+    .where('organization_id', '=', organizationId)
+    .executeTakeFirst()
   if (!task) {
     await sock.sendMessage(ownJid, { text: `Task #${taskId} not found.` })
     return
@@ -450,7 +504,17 @@ function isSelfChat(m: WAMessage, ownJid: string): boolean {
 // people can pull up their own task's chat log without needing admin
 // access — see handleSummaryCommand for how that gets scoped to their own
 // tasks only.
-export async function handleCommandMessage(sock: WASocket, ownJid: string | null, m: WAMessage): Promise<void> {
+// `organizationId` is the organization that owns the WhatsApp session which
+// received this message — every command scopes its task queries to it, so
+// two sessions in the *same* organization see and can manage the exact same
+// shared task pool (regardless of which of them created a given task),
+// while a session in a *different* organization never sees it at all.
+export async function handleCommandMessage(
+  sock: WASocket,
+  ownJid: string | null,
+  m: WAMessage,
+  organizationId: number
+): Promise<void> {
   if (!ownJid || !m.key.remoteJid) return
 
   const text = m.message?.conversation ?? m.message?.extendedTextMessage?.text
@@ -463,9 +527,9 @@ export async function handleCommandMessage(sock: WASocket, ownJid: string | null
 
   if (command.type === 'summary') {
     if (selfChat) {
-      await handleSummaryCommand(sock, ownJid, command.identifier, command.date, null)
+      await handleSummaryCommand(sock, ownJid, organizationId, command.identifier, command.date, null)
     } else if (!m.key.fromMe && !isJidGroup(m.key.remoteJid)) {
-      await handleSummaryCommand(sock, m.key.remoteJid, command.identifier, command.date, m.key.remoteJid)
+      await handleSummaryCommand(sock, m.key.remoteJid, organizationId, command.identifier, command.date, m.key.remoteJid)
     }
     return
   }
@@ -475,11 +539,21 @@ export async function handleCommandMessage(sock: WASocket, ownJid: string | null
   if (command.type === 'help') {
     await sock.sendMessage(ownJid, { text: HELP_TEXT })
   } else if (command.type === 'status') {
-    await handleStatusCommand(sock, ownJid, command.query, command.statusFilter, command.category, command.dateFrom, command.dateTo)
+    await handleStatusCommand(
+      sock,
+      ownJid,
+      organizationId,
+      command.query,
+      command.statusFilter,
+      command.category,
+      command.dateFrom,
+      command.dateTo
+    )
   } else if (command.type === 'report') {
     await handleReportCommand(
       sock,
       ownJid,
+      organizationId,
       command.period,
       command.recipient,
       command.statusFilter,
@@ -487,13 +561,14 @@ export async function handleCommandMessage(sock: WASocket, ownJid: string | null
       command.category
     )
   } else if (command.type === 'complete') {
-    await handleCompleteCommand(sock, ownJid, command.taskId)
+    await handleCompleteCommand(sock, ownJid, organizationId, command.taskId)
   } else if (command.type === 'chat') {
-    await handleChatCommand(sock, ownJid, command.taskId)
+    await handleChatCommand(sock, ownJid, organizationId, command.taskId)
   } else if (command.type === 'remind') {
     await handleRemindCommand(
       sock,
       ownJid,
+      organizationId,
       command.taskId,
       command.stop
         ? { stop: true }
@@ -503,14 +578,15 @@ export async function handleCommandMessage(sock: WASocket, ownJid: string | null
     await handleRecurCommand(
       sock,
       ownJid,
+      organizationId,
       command.taskId,
       command.off
         ? { off: true }
         : { off: false, intervalValue: command.intervalValue, intervalUnit: command.intervalUnit, time: command.time }
     )
   } else if (command.type === 'priority') {
-    await handlePriorityCommand(sock, ownJid, command.taskId, command.priority)
+    await handlePriorityCommand(sock, ownJid, organizationId, command.taskId, command.priority)
   } else if (command.type === 'category') {
-    await handleCategoryCommand(sock, ownJid, command.taskId, command.category)
+    await handleCategoryCommand(sock, ownJid, organizationId, command.taskId, command.category)
   }
 }

@@ -1,6 +1,6 @@
 import { Router } from 'express'
 import { db } from '../../db/index.js'
-import { getSocket, getSnapshot } from '../../whatsapp/connectionManager.js'
+import { getPrimarySocket, getPrimarySnapshot } from '../../whatsapp/connectionManager.js'
 import { upsertGroupMetadata } from '../../whatsapp/store.js'
 import { recordAuditLog } from '../../lib/auditLog.js'
 
@@ -16,10 +16,10 @@ groupsRouter.get('/groups', async (_req, res) => {
 })
 
 groupsRouter.post('/groups/sync', async (req, res) => {
-  const sock = getSocket()
-  const snapshot = getSnapshot()
+  const sock = getPrimarySocket()
+  const snapshot = getPrimarySnapshot()
 
-  if (!sock || snapshot.status !== 'connected') {
+  if (!sock || !snapshot) {
     const groups = await fetchGroups()
     res.status(400).json({ groups, message: 'WhatsApp is not connected — connect it first to sync groups.' })
     return

@@ -2,7 +2,7 @@ import type { Job } from 'pg-boss'
 import pino from 'pino'
 import { boss } from './boss.js'
 import { db } from '../db/index.js'
-import { getSocket, getSnapshot } from '../whatsapp/connectionManager.js'
+import { getPrimarySocket } from '../whatsapp/connectionManager.js'
 import { formatShortDate } from '../lib/dateFormat.js'
 import { isProduction } from '../config/env.js'
 
@@ -149,12 +149,14 @@ async function processTaskReminder(taskId: number): Promise<void> {
     return
   }
 
-  const sock = getSocket()
-  const snapshot = getSnapshot()
+  // Reminders always go out from the org's admin (primary) session, no
+  // matter which session's #task message created this one — a delegator
+  // session's number is never used to send reminders.
+  const sock = getPrimarySocket()
 
-  if (!sock || snapshot.status !== 'connected') {
-    // WhatsApp isn't connected right now — don't drop the reminder, just
-    // push it back a few minutes and try again.
+  if (!sock) {
+    // The primary session isn't connected right now — don't drop the
+    // reminder, just push it back a few minutes and try again.
     const retryAt = new Date(Date.now() + 5 * 60_000)
     const jobId = await enqueueTaskReminder(taskId, retryAt)
     await db

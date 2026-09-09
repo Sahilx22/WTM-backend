@@ -3,6 +3,7 @@ import { db } from '../db/index.js'
 export interface ReportBranding {
   companyName: string
   logoBuffer: Buffer | null
+  adminWaNumber: string | null
 }
 
 const FALLBACK_NAME = 'WhatsApp Task Report'
@@ -29,26 +30,22 @@ async function fetchLogoBuffer(url: string): Promise<Buffer | null> {
   }
 }
 
-// Reports are branded for whichever organization's number is currently
-// connected — there's exactly one live WhatsApp connection per running
-// instance today, so this is unambiguous until per-org connections ship
-// (see connectionManager.ts). Falls back to the first organization on
-// record, then to a generic label if there's none at all.
-export async function loadReportBranding(): Promise<ReportBranding> {
-  const connection = await db.selectFrom('whatsapp_connection').select('phone_number').where('id', '=', 1).executeTakeFirst()
+// Reports are branded for whichever organization the caller already knows
+// it's generating for — every caller has this now (a WhatsApp session
+// always belongs to exactly one organization; a logged-in org user's own
+// token carries it too). Falls back to the first organization on record
+// (used for the super admin's unscoped cross-org views), then to a generic
+// label if there's none at all.
+export async function loadReportBranding(organizationId?: number): Promise<ReportBranding> {
+  const org =
+    organizationId !== undefined
+      ? await db.selectFrom('organizations').select(['name', 'logo_url', 'admin_wa_number']).where('id', '=', organizationId).executeTakeFirst()
+      : await db.selectFrom('organizations').select(['name', 'logo_url', 'admin_wa_number']).orderBy('id', 'asc').executeTakeFirst()
 
-  const matchedOrg = connection?.phone_number
-    ? await db
-        .selectFrom('organizations')
-        .select(['name', 'logo_url'])
-        .where('admin_wa_number', '=', connection.phone_number)
-        .executeTakeFirst()
-    : undefined
+  if (!org) return { companyName: FALLBACK_NAME, logoBuffer: null, adminWaNumber: null }
 
-  const org = matchedOrg ?? (await db.selectFrom('organizations').select(['name', 'logo_url']).orderBy('id', 'asc').executeTakeFirst())
-
-  if (!org) return { companyName: FALLBACK_NAME, logoBuffer: null }
-
+  // Missing logo/number for this org just render blank in the PDF — never
+  // borrowed from another organization's row.
   const logoBuffer = org.logo_url ? await fetchLogoBuffer(org.logo_url) : null
-  return { companyName: org.name, logoBuffer }
+  return { companyName: org.name, logoBuffer, adminWaNumber: org.admin_wa_number }
 }

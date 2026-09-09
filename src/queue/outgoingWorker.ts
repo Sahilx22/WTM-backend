@@ -2,7 +2,7 @@ import type { Job } from 'pg-boss'
 import { boss, QUEUE_SEND_MESSAGE, enqueueSendJob, type SendJobData } from './boss.js'
 import { db } from '../db/index.js'
 import { waitForSendSlot, recordSendOutcome } from './rateLimiter.js'
-import { getSocket, getSnapshot } from '../whatsapp/connectionManager.js'
+import { getPrimarySocket } from '../whatsapp/connectionManager.js'
 import { buildMessageContent } from '../whatsapp/send.js'
 import { cacheOwnMessage } from '../whatsapp/store.js'
 import { bumpCampaignCounters } from './campaignProgress.js'
@@ -49,13 +49,12 @@ async function processMessage(messageId: number): Promise<void> {
 
   await db.updateTable('messages').set({ status: 'sending', updated_at: new Date() }).where('id', '=', messageId).execute()
 
-  const sock = getSocket()
-  const snapshot = getSnapshot()
+  const sock = getPrimarySocket()
 
   let error: string | null = null
   let waMessageId: string | null = null
 
-  if (!sock || snapshot.status !== 'connected') {
+  if (!sock) {
     error = 'WhatsApp is not connected.'
   } else {
     try {

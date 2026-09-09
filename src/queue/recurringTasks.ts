@@ -2,7 +2,7 @@ import type { Job } from 'pg-boss'
 import pino from 'pino'
 import { boss } from './boss.js'
 import { db } from '../db/index.js'
-import { getSocket, getSnapshot } from '../whatsapp/connectionManager.js'
+import { getPrimarySocket } from '../whatsapp/connectionManager.js'
 import { scheduleNextReminder } from './taskReminders.js'
 import { isProduction } from '../config/env.js'
 import type { Task } from '../db/schema.js'
@@ -86,15 +86,22 @@ async function processRecurrence(taskId: number): Promise<void> {
       recurrence_interval_value: original.recurrence_interval_value,
       recurrence_interval_unit: original.recurrence_interval_unit,
       recurrence_time: original.recurrence_time,
-      recurrence_parent_id: original.id
+      recurrence_parent_id: original.id,
+      // Recreation is an automatic system action, not a fresh delegation —
+      // attribute the new occurrence to whoever created the original chain,
+      // in the same organization.
+      created_by_session_id: original.created_by_session_id,
+      organization_id: original.organization_id
     })
     .returning('id')
     .executeTakeFirstOrThrow()
 
-  const sock = getSocket()
-  const snapshot = getSnapshot()
+  // Recurring-task notifications always go out from the org's admin
+  // (primary) session, same as reminders — never the delegator session that
+  // may have created the original task.
+  const sock = getPrimarySocket()
 
-  if (sock && snapshot.status === 'connected') {
+  if (sock) {
     try {
       const result = await sock.sendMessage(original.recipient_jid, { text: `🔁 ${original.name}` })
       if (result?.key?.id) {

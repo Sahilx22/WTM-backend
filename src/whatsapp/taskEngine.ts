@@ -42,7 +42,9 @@ async function createTaskFromPhoneMessage(
   sock: WASocket,
   recipientJid: string,
   originalMessageId: string,
-  text: string
+  text: string,
+  sessionId: number | null,
+  organizationId: number | null
 ): Promise<void> {
   const parsed = parseTaskMessage(text)
   if (!parsed) return
@@ -60,7 +62,9 @@ async function createTaskFromPhoneMessage(
       reminder_times_per_day: parsed.timesPerDay,
       reminder_interval_days: parsed.intervalDays,
       target_date: parsed.targetDate,
-      status: 'pending'
+      status: 'pending',
+      created_by_session_id: sessionId,
+      organization_id: organizationId
     })
     .returning('id')
     .executeTakeFirstOrThrow()
@@ -74,7 +78,7 @@ async function createTaskFromPhoneMessage(
     await scheduleNextReminder(created.id)
   }
 
-  logger.info({ taskId: created.id, name: parsed.name, recipientJid }, 'created task from phone message')
+  logger.info({ taskId: created.id, name: parsed.name, recipientJid, sessionId }, 'created task from phone message')
 
   await recordAuditLog({
     userId: null,
@@ -88,7 +92,8 @@ async function createTaskFromPhoneMessage(
       timesPerDay: parsed.timesPerDay,
       intervalDays: parsed.intervalDays,
       targetDate: parsed.targetDate,
-      recipientJid
+      recipientJid,
+      sessionId
     }
   })
 }
@@ -154,8 +159,18 @@ async function handleThumbsUpReaction(reactedMessageId: string): Promise<void> {
 
 // Called for every message our socket sees (both messages we send from the
 // linked phone and messages/reactions we receive). Errors are caught by the
-// caller so a single bad message never takes down the connection.
-export async function handleMessageForTasks(sock: WASocket, m: WAMessage): Promise<void> {
+// caller so a single bad message never takes down the connection. `sessionId`
+// identifies which WhatsApp session received this message — recorded on any
+// task it creates (see createTaskFromPhoneMessage) so the system knows which
+// session/employee delegated it. `organizationId` is that session's own
+// organization — stamped on the task so it never shows up in another
+// organization's task list/reports/commands.
+export async function handleMessageForTasks(
+  sock: WASocket,
+  m: WAMessage,
+  sessionId: number | null,
+  organizationId: number | null
+): Promise<void> {
   const reaction = m.message?.reactionMessage
 
   if (reaction?.key?.id && !m.key.fromMe) {
@@ -181,6 +196,6 @@ export async function handleMessageForTasks(sock: WASocket, m: WAMessage): Promi
   // this is a deliberate design choice: tasks are created by typing "#task"
   // in a normal WhatsApp chat, not through this web app's compose UI.
   if (m.key.fromMe && m.key.remoteJid) {
-    await createTaskFromPhoneMessage(sock, m.key.remoteJid, m.key.id, text)
+    await createTaskFromPhoneMessage(sock, m.key.remoteJid, m.key.id, text, sessionId, organizationId)
   }
 }

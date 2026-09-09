@@ -2,7 +2,7 @@ import type { Job } from 'pg-boss'
 import pino from 'pino'
 import { boss } from './boss.js'
 import { db } from '../db/index.js'
-import { getSocket, getSnapshot } from '../whatsapp/connectionManager.js'
+import { getPrimarySocket, getPrimarySnapshot } from '../whatsapp/connectionManager.js'
 import { getReportData, type ReportPeriod } from '../reports/taskMetrics.js'
 import { renderTaskReportPdf } from '../reports/taskReportPdf.js'
 import { loadReportBranding } from '../reports/branding.js'
@@ -79,16 +79,21 @@ interface AutoReportJobData {
 }
 
 async function sendAutoReport(period: ReportPeriod): Promise<void> {
-  const sock = getSocket()
-  const snapshot = getSnapshot()
+  // Auto-reports, like reminders, always come from the org's admin
+  // (primary) session — never a delegator session.
+  const sock = getPrimarySocket()
+  const snapshot = getPrimarySnapshot()
 
-  if (!sock || snapshot.status !== 'connected' || !snapshot.waJid) {
-    logger.warn({ period }, 'skipped auto report — WhatsApp not connected')
+  if (!sock || !snapshot?.waJid) {
+    logger.warn({ period }, 'skipped auto report — no primary WhatsApp session connected')
     return
   }
 
   try {
-    const [data, branding] = await Promise.all([getReportData(period), loadReportBranding()])
+    const [data, branding] = await Promise.all([
+      getReportData(period, undefined, undefined, undefined, undefined, snapshot.organizationId),
+      loadReportBranding(snapshot.organizationId)
+    ])
     const pdf = await renderTaskReportPdf(data, branding)
     const filename = `task-report-${period}-${new Date().toISOString().slice(0, 10)}.pdf`
 

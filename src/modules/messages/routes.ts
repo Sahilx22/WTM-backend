@@ -3,7 +3,7 @@ import { db } from '../../db/index.js'
 import { sendMessageSchema } from './schemas.js'
 import { mediaUpload, getMediaSignedUrl } from '../../lib/mediaUpload.js'
 import { recordAuditLog } from '../../lib/auditLog.js'
-import { getSocket, getSnapshot } from '../../whatsapp/connectionManager.js'
+import { getPrimarySocket } from '../../whatsapp/connectionManager.js'
 import { enqueueSendJob } from '../../queue/boss.js'
 import { resolveRecipients, resolveMedia } from './shared.js'
 
@@ -49,9 +49,8 @@ messagesRouter.post('/send', mediaUpload.single('file'), async (req, res) => {
   const { recipient_type, contact_ids, raw_numbers, group_ids, message_type, message_text, template_id } =
     parsed.data
 
-  const snapshot = getSnapshot()
-  const sock = getSocket()
-  if (!sock || snapshot.status !== 'connected') {
+  const sock = getPrimarySocket()
+  if (!sock) {
     fail('WhatsApp is not connected. Connect it from the WhatsApp Connection page first.')
     return
   }
