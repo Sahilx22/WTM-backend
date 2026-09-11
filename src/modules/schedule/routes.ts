@@ -3,7 +3,7 @@ import { db } from '../../db/index.js'
 import { scheduleMessageSchema } from '../messages/schemas.js'
 import { mediaUpload, getMediaSignedUrl } from '../../lib/mediaUpload.js'
 import { recordAuditLog } from '../../lib/auditLog.js'
-import { getPrimarySocket } from '../../whatsapp/connectionManager.js'
+import { getPrimarySocketForOrganization } from '../../whatsapp/connectionManager.js'
 import { enqueueSendJob, cancelSendJob } from '../../queue/boss.js'
 import { resolveRecipients, resolveMedia } from '../messages/shared.js'
 
@@ -11,17 +11,24 @@ export const scheduleRouter = Router()
 
 const MAX_RECIPIENTS_PER_SCHEDULE = 50
 
-async function loadFormData(templateId?: number | null) {
+async function loadFormData(templateId: number | null | undefined, organizationId: number | undefined) {
+  let contactsQuery = db.selectFrom('contacts').selectAll().orderBy('display_name', 'asc').orderBy('phone_number', 'asc').limit(500)
+  let groupsQuery = db.selectFrom('groups').selectAll().orderBy('subject', 'asc')
+  let templatesQuery = db.selectFrom('message_templates').selectAll().orderBy('name', 'asc')
+  let scheduledQuery = db.selectFrom('messages').selectAll().where('status', '=', 'scheduled').orderBy('scheduled_at', 'asc')
+
+  if (organizationId !== undefined) {
+    contactsQuery = contactsQuery.where('organization_id', '=', organizationId)
+    groupsQuery = groupsQuery.where('organization_id', '=', organizationId)
+    templatesQuery = templatesQuery.where('organization_id', '=', organizationId)
+    scheduledQuery = scheduledQuery.where('organization_id', '=', organizationId)
+  }
+
   const [contacts, groups, templateRows, scheduled] = await Promise.all([
-    db.selectFrom('contacts').selectAll().orderBy('display_name', 'asc').orderBy('phone_number', 'asc').limit(500).execute(),
-    db.selectFrom('groups').selectAll().orderBy('subject', 'asc').execute(),
-    db.selectFrom('message_templates').selectAll().orderBy('name', 'asc').execute(),
-    db
-      .selectFrom('messages')
-      .selectAll()
-      .where('status', '=', 'scheduled')
-      .orderBy('scheduled_at', 'asc')
-      .execute()
+    contactsQuery.execute(),
+    groupsQuery.execute(),
+    templatesQuery.execute(),
+    scheduledQuery.execute()
   ])
 
   const templates = await Promise.all(
@@ -35,7 +42,7 @@ async function loadFormData(templateId?: number | null) {
 
 scheduleRouter.get('/schedule', async (req, res) => {
   const templateId = req.query.template_id ? Number(req.query.template_id) : null
-  const formData = await loadFormData(templateId)
+  const formData = await loadFormData(templateId, req.user?.organizationId ?? undefined)
 
   res.json(formData)
 })
@@ -49,6 +56,12 @@ scheduleRouter.post('/schedule', mediaUpload.single('file'), async (req, res) =>
 
   if (!parsed.success) {
     fail(parsed.error.issues[0]?.message ?? 'Invalid input.')
+    return
+  }
+
+  const organizationId = req.user?.organizationId
+  if (!organizationId) {
+    fail('Only an organization account can schedule messages.')
     return
   }
 
@@ -74,18 +87,22 @@ scheduleRouter.post('/schedule', mediaUpload.single('file'), async (req, res) =>
     return
   }
 
-  const sock = getPrimarySocket()
+  const sock = getPrimarySocketForOrganization(organizationId)
   if (!sock) {
     fail('WhatsApp is not connected. Connect it from the WhatsApp Connection page first.')
     return
   }
 
-  const { recipients, skipped } = await resolveRecipients(sock, {
-    recipientType: recipient_type,
-    contactIds: contact_ids,
-    rawNumbers: raw_numbers,
-    groupIds: group_ids
-  })
+  const { recipients, skipped } = await resolveRecipients(
+    sock,
+    {
+      recipientType: recipient_type,
+      contactIds: contact_ids,
+      rawNumbers: raw_numbers,
+      groupIds: group_ids
+    },
+    organizationId
+  )
 
   if (recipients.length === 0) {
     fail('No valid recipients were resolved. Check the numbers/contacts/groups you selected.')
@@ -104,7 +121,7 @@ scheduleRouter.post('/schedule', mediaUpload.single('file'), async (req, res) =>
     return
   }
 
-  const mediaResult = await resolveMedia(message_type, req.file, template_id)
+  const mediaResult = await resolveMedia(message_type, req.file, template_id, organizationId)
   if (!mediaResult.ok) {
     fail(mediaResult.error)
     return
@@ -124,7 +141,8 @@ scheduleRouter.post('/schedule', mediaUpload.single('file'), async (req, res) =>
         template_id,
         status: 'scheduled' as const,
         scheduled_at: scheduledAt,
-        created_by: req.user?.id ?? null
+        created_by: req.user?.id ?? null,
+        organization_id: organizationId
       }))
     )
     .returning('id')
@@ -148,11 +166,11 @@ scheduleRouter.post('/schedule', mediaUpload.single('file'), async (req, res) =>
 
 scheduleRouter.delete('/schedule/:id', async (req, res) => {
   const id = Number(req.params.id)
-  const message = await db
-    .selectFrom('messages')
-    .select(['id', 'status', 'pg_boss_job_id', 'media_path'])
-    .where('id', '=', id)
-    .executeTakeFirst()
+  const organizationId = req.user?.organizationId ?? undefined
+
+  let messageQuery = db.selectFrom('messages').select(['id', 'status', 'pg_boss_job_id', 'media_path']).where('id', '=', id)
+  if (organizationId !== undefined) messageQuery = messageQuery.where('organization_id', '=', organizationId)
+  const message = await messageQuery.executeTakeFirst()
 
   if (message && (message.status === 'scheduled' || message.status === 'queued')) {
     await cancelSendJob(message.pg_boss_job_id)

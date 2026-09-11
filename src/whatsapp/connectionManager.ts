@@ -100,29 +100,52 @@ export function getSocketForSession(sessionId: number): WASocket | null {
   return runtimes.get(sessionId)?.sock ?? null
 }
 
-// Resolves the socket every reminder/auto-report goes out through: whichever
-// session is flagged primary *and* currently connected. In the (unusual)
-// case where more than one organization has a connected primary session at
-// once, the lowest session id wins — deterministic, though this app is
-// built around one actively-used organization at a time.
-export function getPrimarySocket(): WASocket | null {
-  const candidates = [...runtimes.values()]
-    .filter((r) => r.snapshot.isPrimary && r.snapshot.status === 'connected' && r.sock)
-    .sort((a, b) => a.snapshot.sessionId - b.snapshot.sessionId)
-  return candidates[0]?.sock ?? null
+// Resolves the socket every reminder/auto-report/send for a *specific*
+// organization goes out through: whichever of that org's own sessions is
+// flagged primary *and* currently connected. Every outgoing-send call site
+// must pass the organization the message/task/report actually belongs to —
+// never falls back to some other organization's session, even if that one
+// happens to be connected and this one isn't (see the former getPrimarySocket()
+// this replaced, which scanned every organization's runtimes and could
+// route one org's outgoing message through a completely different org's
+// WhatsApp number).
+export function getPrimarySocketForOrganization(organizationId: number): WASocket | null {
+  for (const r of runtimes.values()) {
+    if (r.snapshot.organizationId === organizationId && r.snapshot.isPrimary && r.snapshot.status === 'connected' && r.sock) {
+      return r.sock
+    }
+  }
+  return null
 }
 
-export function isPrimaryConnected(): boolean {
-  return getPrimarySocket() !== null
+// The connected primary session's own snapshot for one organization — used
+// wherever a job needs to send *to* the admin's own number (auto-reports),
+// not just through it.
+export function getPrimarySnapshotForOrganization(organizationId: number): SessionSnapshot | null {
+  for (const r of runtimes.values()) {
+    if (r.snapshot.organizationId === organizationId && r.snapshot.isPrimary && r.snapshot.status === 'connected' && r.sock) {
+      return r.snapshot
+    }
+  }
+  return null
 }
 
-// The connected primary session's own snapshot — used wherever a job needs
-// to send *to* the admin's own number (auto-reports), not just through it.
-export function getPrimarySnapshot(): SessionSnapshot | null {
-  const candidates = [...runtimes.values()]
-    .filter((r) => r.snapshot.isPrimary && r.snapshot.status === 'connected' && r.sock)
-    .sort((a, b) => a.snapshot.sessionId - b.snapshot.sessionId)
-  return candidates[0]?.snapshot ?? null
+// Whether *any* session, for any organization, is currently connected — used
+// by queue/lifecycle.ts to decide whether pg-boss (reminders, auto-reports,
+// digests, the outgoing-message queue) has anything to do at all right now.
+export function isAnySessionConnected(): boolean {
+  return [...runtimes.values()].some((r) => r.snapshot.status === 'connected')
+}
+
+// Every organization that currently has a connected primary session — used
+// by jobs that must sweep every tenant (auto-reports/digests at boot, and
+// after any settings change) rather than act on just one.
+export function listConnectedPrimaryOrganizationIds(): number[] {
+  const ids = new Set<number>()
+  for (const r of runtimes.values()) {
+    if (r.snapshot.isPrimary && r.snapshot.status === 'connected' && r.sock) ids.add(r.snapshot.organizationId)
+  }
+  return [...ids]
 }
 
 export async function listSessionsForOrganization(organizationId: number): Promise<SessionSnapshot[]> {
@@ -279,7 +302,7 @@ export async function startConnection(sessionId: number): Promise<void> {
 
     sock.ev.on('groups.upsert', async (groups) => {
       for (const group of groups) {
-        await upsertGroupMetadata(group, runtime.snapshot.waJid ?? undefined)
+        await upsertGroupMetadata(group, runtime.snapshot.organizationId, runtime.snapshot.waJid ?? undefined)
       }
     })
 
@@ -288,7 +311,7 @@ export async function startConnection(sessionId: number): Promise<void> {
         if (!update.id) continue
         try {
           const metadata = await sock.groupMetadata(update.id)
-          await upsertGroupMetadata(metadata, runtime.snapshot.waJid ?? undefined)
+          await upsertGroupMetadata(metadata, runtime.snapshot.organizationId, runtime.snapshot.waJid ?? undefined)
         } catch (err) {
           logger.warn({ err, jid: update.id }, 'failed to refresh group metadata after groups.update')
         }
@@ -298,7 +321,7 @@ export async function startConnection(sessionId: number): Promise<void> {
     sock.ev.on('group-participants.update', async (event) => {
       try {
         const metadata = await sock.groupMetadata(event.id)
-        await upsertGroupMetadata(metadata, runtime.snapshot.waJid ?? undefined)
+        await upsertGroupMetadata(metadata, runtime.snapshot.organizationId, runtime.snapshot.waJid ?? undefined)
       } catch (err) {
         logger.warn({ err, jid: event.id }, 'failed to refresh group metadata after participants update')
       }
@@ -327,7 +350,7 @@ export async function startConnection(sessionId: number): Promise<void> {
     sock.ev.on('messaging-history.set', async ({ contacts }) => {
       if (contacts.length === 0) return
       try {
-        const imported = await upsertContactsFromWhatsApp(contacts)
+        const imported = await upsertContactsFromWhatsApp(contacts, runtime.snapshot.organizationId)
         logger.info({ sessionId, received: contacts.length, imported }, 'synced contacts from WhatsApp history')
       } catch (err) {
         logger.warn({ err }, 'failed to sync contacts from history batch')
@@ -336,7 +359,7 @@ export async function startConnection(sessionId: number): Promise<void> {
 
     sock.ev.on('contacts.upsert', async (contacts) => {
       try {
-        await upsertContactsFromWhatsApp(contacts)
+        await upsertContactsFromWhatsApp(contacts, runtime.snapshot.organizationId)
       } catch (err) {
         logger.warn({ err }, 'failed to sync contacts.upsert')
       }
@@ -346,7 +369,7 @@ export async function startConnection(sessionId: number): Promise<void> {
       const complete = updates.filter((u): u is typeof u & { id: string } => Boolean(u.id))
       if (complete.length === 0) return
       try {
-        await upsertContactsFromWhatsApp(complete)
+        await upsertContactsFromWhatsApp(complete, runtime.snapshot.organizationId)
       } catch (err) {
         logger.warn({ err }, 'failed to sync contacts.update')
       }
@@ -423,5 +446,29 @@ export async function bootAllSessions(): Promise<void> {
     void startConnection(row.id).catch((err) => {
       logger.error({ err, sessionId: row.id }, 'failed to start WhatsApp session on boot')
     })
+  }
+}
+
+// Called once, from server.ts's graceful shutdown, before the Postgres pool
+// closes. Cancels any pending reconnect timers first (so a timer firing
+// mid-shutdown can't kick off a fresh connection attempt — and a fresh DB
+// query — after the pool is already gone), then best-effort closes every
+// live socket. Never throws: a socket that won't close cleanly shouldn't
+// block process exit, and this intentionally does NOT touch the database —
+// no session status is persisted here, since bootAllSessions() will just
+// resume from saved auth state on the next boot regardless.
+export function shutdownAllSockets(): void {
+  for (const runtime of runtimes.values()) {
+    if (runtime.reconnectTimer) {
+      clearTimeout(runtime.reconnectTimer)
+      runtime.reconnectTimer = null
+    }
+    if (runtime.sock) {
+      try {
+        runtime.sock.end(undefined)
+      } catch (err) {
+        logger.warn({ err, sessionId: runtime.snapshot.sessionId }, 'error closing WhatsApp socket during shutdown')
+      }
+    }
   }
 }

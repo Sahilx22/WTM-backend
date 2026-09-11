@@ -376,7 +376,7 @@ async function handleSummaryCommand(
     .where('tasks.organization_id', '=', organizationId)
 
   if (restrictToJid) {
-    const contactId = await resolveContactId(sock, restrictToJid).catch(() => null)
+    const contactId = await resolveContactId(sock, restrictToJid, organizationId).catch(() => null)
     taskQuery = taskQuery.where((eb) => {
       const conditions = [eb('tasks.recipient_jid', '=', restrictToJid)]
       if (contactId) conditions.push(eb('tasks.contact_id', '=', contactId))

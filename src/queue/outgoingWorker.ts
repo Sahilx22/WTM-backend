@@ -2,7 +2,7 @@ import type { Job } from 'pg-boss'
 import { boss, QUEUE_SEND_MESSAGE, enqueueSendJob, type SendJobData } from './boss.js'
 import { db } from '../db/index.js'
 import { waitForSendSlot, recordSendOutcome } from './rateLimiter.js'
-import { getPrimarySocket } from '../whatsapp/connectionManager.js'
+import { getPrimarySocketForOrganization } from '../whatsapp/connectionManager.js'
 import { buildMessageContent } from '../whatsapp/send.js'
 import { cacheOwnMessage } from '../whatsapp/store.js'
 import { bumpCampaignCounters } from './campaignProgress.js'
@@ -25,6 +25,20 @@ async function processMessage(messageId: number): Promise<void> {
   const message = await db.selectFrom('messages').selectAll().where('id', '=', messageId).executeTakeFirst()
   if (!message || message.status === 'cancelled') return
 
+  // Every message belongs to exactly one organization (see migration 035) —
+  // its own org's rate limits/rolling counts apply, and it can only ever go
+  // out through that org's own primary session, never a different org's.
+  const organizationId = message.organization_id
+  if (organizationId === null) {
+    await recordAttempt(messageId, message.retry_count + 1, false, 'Message has no owning organization.')
+    await db
+      .updateTable('messages')
+      .set({ status: 'failed', retry_count: message.retry_count + 1, failure_reason: 'Message has no owning organization.', updated_at: new Date() })
+      .where('id', '=', messageId)
+      .execute()
+    return
+  }
+
   let rateOverride: { minDelayMs?: number; maxDelayMs?: number } | null = null
   if (message.campaign_id) {
     const campaign = await db
@@ -36,7 +50,7 @@ async function processMessage(messageId: number): Promise<void> {
     if (raw) rateOverride = raw
   }
 
-  await waitForSendSlot(rateOverride)
+  await waitForSendSlot(organizationId, rateOverride)
 
   // Re-check after potentially waiting a while — the message may have been
   // cancelled in the meantime.
@@ -49,7 +63,7 @@ async function processMessage(messageId: number): Promise<void> {
 
   await db.updateTable('messages').set({ status: 'sending', updated_at: new Date() }).where('id', '=', messageId).execute()
 
-  const sock = getPrimarySocket()
+  const sock = getPrimarySocketForOrganization(organizationId)
 
   let error: string | null = null
   let waMessageId: string | null = null
@@ -88,12 +102,12 @@ async function processMessage(messageId: number): Promise<void> {
       .where('id', '=', messageId)
       .execute()
 
-    await recordSendOutcome(true)
+    await recordSendOutcome(organizationId, true)
     if (message.campaign_id) await bumpCampaignCounters(message.campaign_id, true)
     return
   }
 
-  await recordSendOutcome(false)
+  await recordSendOutcome(organizationId, false)
 
   if (attemptNumber >= MAX_SEND_ATTEMPTS) {
     await db

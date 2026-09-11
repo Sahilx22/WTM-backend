@@ -1,15 +1,10 @@
 import './config/paths.js'
 import { env } from './config/env.js'
 import { app } from './app.js'
-import { pool } from './db/index.js'
-import { bootAllSessions } from './whatsapp/connectionManager.js'
-import { boss, startBoss } from './queue/boss.js'
-import { startOutgoingWorker } from './queue/outgoingWorker.js'
-import { getRateLimitConfig } from './queue/rateLimiter.js'
-import { initTaskReminderQueue, startTaskReminderWorker } from './queue/taskReminders.js'
-import { initAutoReportQueues, startAutoReportWorkers, applyAutoReportSchedules, loadTaskSettings } from './queue/autoReports.js'
-import { initDigestQueues, startDigestWorkers, applyDigestSchedules } from './queue/scheduledDigests.js'
-import { initRecurringTaskQueue, startRecurringTaskWorker } from './queue/recurringTasks.js'
+import { pool, getPoolStats } from './db/index.js'
+import { bootAllSessions, shutdownAllSockets } from './whatsapp/connectionManager.js'
+import { stopBoss } from './queue/boss.js'
+import { initQueueLifecycle } from './queue/lifecycle.js'
 
 const server = app.listen(env.PORT, () => {
   console.log(`WA Messenger listening on http://localhost:${env.PORT}`)
@@ -39,12 +34,22 @@ async function shutdown(signal: string): Promise<void> {
     console.error('Error closing HTTP server:', err)
   }
 
+  // Best-effort — never blocks the rest of shutdown on a socket that won't
+  // close cleanly. Also cancels pending reconnect timers, so nothing tries
+  // to open a fresh DB query after the pool below is gone.
+  shutdownAllSockets()
+
   try {
-    await boss.stop({ graceful: true, timeout: 5000 })
+    await stopBoss()
   } catch (err) {
     console.error('Error stopping pg-boss:', err)
   }
 
+  // pool.end() is only ever called here, on process shutdown — never after
+  // a request, message, or job. Logged so a stuck shutdown (something still
+  // holding a connection) is visible instead of silently hanging until the
+  // 10s force-exit fallback below fires.
+  console.log('Postgres pool before close:', getPoolStats())
   try {
     await pool.end()
   } catch (err) {
@@ -58,28 +63,14 @@ async function shutdown(signal: string): Promise<void> {
 process.on('SIGTERM', () => void shutdown('SIGTERM'))
 process.on('SIGINT', () => void shutdown('SIGINT'))
 
+// Starts/stops pg-boss (reminders, auto-reports, digests, the outgoing
+// queue) in step with whether any WhatsApp session is connected anywhere —
+// see queue/lifecycle.ts. Registered before bootAllSessions() so it's ready
+// to react the moment any resumed session reconnects.
+initQueueLifecycle()
+
 // Resume every organization's previously-created WhatsApp session(s) on
 // boot. A session with no saved creds yet just comes up at qr_pending.
 void bootAllSessions().catch((err) => {
   console.error('Initial WhatsApp session bootstrap failed:', err)
 })
-
-void startBoss()
-  .then(async () => {
-    const cfg = await getRateLimitConfig()
-    await startOutgoingWorker(cfg.concurrency)
-    await initTaskReminderQueue()
-    await startTaskReminderWorker()
-    await initAutoReportQueues()
-    await startAutoReportWorkers()
-    await initDigestQueues()
-    await startDigestWorkers()
-    await initRecurringTaskQueue()
-    await startRecurringTaskWorker()
-    const taskSettings = await loadTaskSettings()
-    await applyAutoReportSchedules(taskSettings)
-    await applyDigestSchedules(taskSettings)
-  })
-  .catch((err) => {
-    console.error('Failed to start the queue workers:', err)
-  })

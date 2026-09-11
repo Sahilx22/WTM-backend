@@ -2,7 +2,7 @@ import type { Job } from 'pg-boss'
 import pino from 'pino'
 import { boss } from './boss.js'
 import { db } from '../db/index.js'
-import { getPrimarySocket } from '../whatsapp/connectionManager.js'
+import { getPrimarySocketForOrganization } from '../whatsapp/connectionManager.js'
 import { formatShortDate } from '../lib/dateFormat.js'
 import { isProduction } from '../config/env.js'
 
@@ -106,16 +106,21 @@ export async function cancelTaskReminder(jobId: string | null): Promise<void> {
 export async function scheduleNextReminder(taskId: number): Promise<void> {
   const task = await db
     .selectFrom('tasks')
-    .select(['reminder_times_per_day', 'reminder_interval_days'])
+    .select(['reminder_times_per_day', 'reminder_interval_days', 'organization_id'])
     .where('id', '=', taskId)
     .executeTakeFirst()
 
   if (!task || (!task.reminder_times_per_day && !task.reminder_interval_days)) return
 
+  if (task.organization_id === null) {
+    logger.warn({ taskId }, 'skipped scheduling reminder — task has no owning organization to load settings for')
+    return
+  }
+
   const settings = await db
     .selectFrom('task_settings')
     .select(['reminder_daily_time', 'working_hours_start', 'working_hours_end'])
-    .where('id', '=', 1)
+    .where('organization_id', '=', task.organization_id)
     .executeTakeFirstOrThrow()
 
   let nextAt: Date
@@ -151,8 +156,9 @@ async function processTaskReminder(taskId: number): Promise<void> {
 
   // Reminders always go out from the org's admin (primary) session, no
   // matter which session's #task message created this one — a delegator
-  // session's number is never used to send reminders.
-  const sock = getPrimarySocket()
+  // session's number is never used to send reminders, and never a different
+  // organization's session.
+  const sock = task.organization_id !== null ? getPrimarySocketForOrganization(task.organization_id) : null
 
   if (!sock) {
     // The primary session isn't connected right now — don't drop the
@@ -168,10 +174,18 @@ async function processTaskReminder(taskId: number): Promise<void> {
   }
 
   const dueText = task.target_date ? ` (due ${formatShortDate(new Date(task.target_date))})` : ''
-  const text = `⏰ [${task.priority}] Reminder: ${task.name}${dueText}`
+  // A task assigned to a specific employee (mentioned in the original group
+  // #task message) still gets its reminder posted to the group, same as
+  // always — it just also @mentions that one employee so it's clear who
+  // it's for, instead of pinging everyone in the chat.
+  const mentionTag = task.assigned_jid ? `@${task.assigned_jid.split('@')[0]} ` : ''
+  const text = `⏰ ${mentionTag}[${task.priority}] Reminder: ${task.name}${dueText}`
 
   try {
-    const result = await sock.sendMessage(task.recipient_jid, { text })
+    const result = await sock.sendMessage(task.recipient_jid, {
+      text,
+      ...(task.assigned_jid ? { mentions: [task.assigned_jid] } : {})
+    })
     if (result?.key?.id) {
       await db
         .insertInto('task_messages')

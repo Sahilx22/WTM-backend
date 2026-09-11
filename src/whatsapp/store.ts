@@ -55,7 +55,10 @@ function isOwnParticipant(p: GroupParticipant, ownJid: string): boolean {
   return false
 }
 
-export async function upsertGroupMetadata(metadata: GroupMetadata, ownJid?: string): Promise<void> {
+// `organizationId` is the syncing session's own org — the same real
+// WhatsApp group gets its own independent row per organization, since each
+// is a separate business (see migration 031).
+export async function upsertGroupMetadata(metadata: GroupMetadata, organizationId: number | null, ownJid?: string): Promise<void> {
   groupMetadataCache.set(metadata.id, metadata)
 
   const isAdmin = ownJid
@@ -66,13 +69,14 @@ export async function upsertGroupMetadata(metadata: GroupMetadata, ownJid?: stri
     .insertInto('groups')
     .values({
       wa_jid: metadata.id,
+      organization_id: organizationId,
       subject: metadata.subject,
       participant_count: metadata.participants?.length ?? 0,
       is_admin: isAdmin ?? false,
       last_synced_at: new Date()
     })
     .onConflict((oc) =>
-      oc.column('wa_jid').doUpdateSet({
+      oc.columns(['organization_id', 'wa_jid']).doUpdateSet({
         subject: metadata.subject,
         participant_count: metadata.participants?.length ?? 0,
         // Only overwrite is_admin when we actually know our own JID; otherwise leave it as-is.
@@ -104,8 +108,11 @@ function resolveContactPhone(contact: Contact): { phoneNumber: string; waJid: st
 // upsert/update events) — there's no on-demand "fetch all contacts" call
 // the way there is for groups. Only contacts we can resolve to an actual
 // phone number are imported; a bare LID with no paired PN yet is skipped
-// since our contacts table is keyed on phone_number.
-export async function upsertContactsFromWhatsApp(contacts: Contact[]): Promise<number> {
+// since our contacts table is keyed on phone_number. `organizationId` is
+// the session's own org — the same real phone number gets its own
+// independent contact row (and name) per organization, since each is a
+// separate business with no business seeing another's contact naming.
+export async function upsertContactsFromWhatsApp(contacts: Contact[], organizationId: number | null): Promise<number> {
   // A single batch can contain more than one Contact entry resolving to the
   // same phone number (e.g. a LID-form and PN-form record for the same
   // person) — Postgres's ON CONFLICT DO UPDATE errors if a multi-row INSERT
@@ -114,7 +121,14 @@ export async function upsertContactsFromWhatsApp(contacts: Contact[]): Promise<n
   // to carry a resolved display name).
   const byPhone = new Map<
     string,
-    { phone_number: string; wa_jid: string; display_name: string | null; is_valid_on_whatsapp: true; source: 'whatsapp' }
+    {
+      phone_number: string
+      wa_jid: string
+      display_name: string | null
+      is_valid_on_whatsapp: true
+      source: 'whatsapp'
+      organization_id: number | null
+    }
   >()
 
   for (const c of contacts) {
@@ -127,7 +141,8 @@ export async function upsertContactsFromWhatsApp(contacts: Contact[]): Promise<n
       wa_jid: resolved.waJid,
       display_name: displayName ?? existing?.display_name ?? null,
       is_valid_on_whatsapp: true,
-      source: 'whatsapp'
+      source: 'whatsapp',
+      organization_id: organizationId
     })
   }
 
@@ -139,7 +154,7 @@ export async function upsertContactsFromWhatsApp(contacts: Contact[]): Promise<n
     .insertInto('contacts')
     .values(rows)
     .onConflict((oc) =>
-      oc.column('phone_number').doUpdateSet((eb) => ({
+      oc.columns(['organization_id', 'phone_number']).doUpdateSet((eb) => ({
         wa_jid: eb.ref('excluded.wa_jid'),
         is_valid_on_whatsapp: true,
         // Only fill in a name if we didn't already have one — never clobber

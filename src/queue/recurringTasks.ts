@@ -2,7 +2,7 @@ import type { Job } from 'pg-boss'
 import pino from 'pino'
 import { boss } from './boss.js'
 import { db } from '../db/index.js'
-import { getPrimarySocket } from '../whatsapp/connectionManager.js'
+import { getPrimarySocketForOrganization } from '../whatsapp/connectionManager.js'
 import { scheduleNextReminder } from './taskReminders.js'
 import { isProduction } from '../config/env.js'
 import type { Task } from '../db/schema.js'
@@ -89,21 +89,27 @@ async function processRecurrence(taskId: number): Promise<void> {
       recurrence_parent_id: original.id,
       // Recreation is an automatic system action, not a fresh delegation —
       // attribute the new occurrence to whoever created the original chain,
-      // in the same organization.
+      // in the same organization, for the same assigned employee (if any).
       created_by_session_id: original.created_by_session_id,
-      organization_id: original.organization_id
+      organization_id: original.organization_id,
+      assigned_jid: original.assigned_jid
     })
     .returning('id')
     .executeTakeFirstOrThrow()
 
   // Recurring-task notifications always go out from the org's admin
   // (primary) session, same as reminders — never the delegator session that
-  // may have created the original task.
-  const sock = getPrimarySocket()
+  // may have created the original task, and never a different organization's
+  // session.
+  const sock = original.organization_id !== null ? getPrimarySocketForOrganization(original.organization_id) : null
 
   if (sock) {
     try {
-      const result = await sock.sendMessage(original.recipient_jid, { text: `🔁 ${original.name}` })
+      const mentionTag = original.assigned_jid ? `@${original.assigned_jid.split('@')[0]} ` : ''
+      const result = await sock.sendMessage(original.recipient_jid, {
+        text: `🔁 ${mentionTag}${original.name}`,
+        ...(original.assigned_jid ? { mentions: [original.assigned_jid] } : {})
+      })
       if (result?.key?.id) {
         await db
           .insertInto('task_messages')

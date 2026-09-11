@@ -95,6 +95,10 @@ export interface ContactsTable {
   created_by: number | null
   created_at: Generated<Date>
   updated_at: Generated<Date>
+  // Which organization this contact belongs to — the same real phone number
+  // can be a separate contact (own name) in more than one organization.
+  // Null only for contacts a super admin created outside any organization.
+  organization_id: number | null
 }
 
 export interface GroupsTable {
@@ -105,6 +109,10 @@ export interface GroupsTable {
   is_admin: Generated<boolean>
   last_synced_at: Date | null
   created_at: Generated<Date>
+  // Which organization synced this group — the same real WhatsApp group can
+  // be a separate row per organization if more than one org's session is a
+  // participant. Null only for groups synced before this was added.
+  organization_id: number | null
 }
 
 export interface BatchesTable {
@@ -115,6 +123,10 @@ export interface BatchesTable {
   created_by: number | null
   created_at: Generated<Date>
   updated_at: Generated<Date>
+  // Which organization owns this batch — every batch query filters by it so
+  // one organization never sees or edits another's batch. Null only for
+  // batches created before this was added.
+  organization_id: number | null
 }
 
 export interface BatchMembersTable {
@@ -134,6 +146,9 @@ export interface MessageTemplatesTable {
   created_by: number | null
   created_at: Generated<Date>
   updated_at: Generated<Date>
+  // Which organization owns this template — null only for templates created
+  // before this was added.
+  organization_id: number | null
 }
 
 export interface CampaignsTable {
@@ -156,6 +171,9 @@ export interface CampaignsTable {
   updated_at: Generated<Date>
   started_at: Date | null
   completed_at: Date | null
+  // Which organization owns this campaign — null only for campaigns created
+  // before this was added.
+  organization_id: number | null
 }
 
 export interface MessagesTable {
@@ -181,6 +199,10 @@ export interface MessagesTable {
   created_by: number | null
   created_at: Generated<Date>
   updated_at: Generated<Date>
+  // Which organization this message belongs to — every history/dashboard/
+  // rate-limit query filters by it. Null only for messages created before
+  // this was added.
+  organization_id: number | null
 }
 
 export interface MessageAttemptsTable {
@@ -194,6 +216,9 @@ export interface MessageAttemptsTable {
 
 export interface RateLimitConfigTable {
   id: Generated<number>
+  // One row per organization (see migration 036) — every org has its own
+  // independent send-rate limits and pause state.
+  organization_id: number
   max_per_minute: Generated<number>
   max_per_hour: Generated<number>
   min_delay_ms: Generated<number>
@@ -276,6 +301,12 @@ export interface TasksTable {
   // it so one organization's sessions never see another's tasks. Null only
   // for pre-multi-tenant tasks that couldn't be backfilled.
   organization_id: number | null
+  // The specific employee @mentioned in a group #task message this task
+  // was created for — null for a 1:1 chat task, or a group task with no
+  // mention (both address recipient_jid directly, as always). Lets several
+  // tasks created from one shared group message (multiple mentions) each
+  // resolve their own contact name and be completed independently.
+  assigned_jid: string | null
 }
 
 export interface TaskMessagesTable {
@@ -301,6 +332,10 @@ export type WeekDay = 'monday' | 'tuesday' | 'wednesday' | 'thursday' | 'friday'
 
 export interface TaskSettingsTable {
   id: Generated<number>
+  // One row per organization (see migration 037) — every org has its own
+  // independent working hours, reminder timing, and auto-report/digest
+  // schedule.
+  organization_id: number
   working_hours_start: Generated<string>
   working_hours_end: Generated<string>
   auto_report_daily_enabled: Generated<boolean>

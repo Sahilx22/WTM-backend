@@ -5,7 +5,7 @@ import { cancelTaskReminder, scheduleNextReminder } from '../../queue/taskRemind
 import { scheduleRecurrence } from '../../queue/recurringTasks.js'
 import { recipientDisplayName } from '../../lib/recipientDisplay.js'
 import { resolveContactId } from '../../whatsapp/taskEngine.js'
-import { getPrimarySocket } from '../../whatsapp/connectionManager.js'
+import { getPrimarySocketForOrganization } from '../../whatsapp/connectionManager.js'
 
 export const tasksRouter = Router()
 
@@ -174,33 +174,39 @@ tasksRouter.get('/tasks/reminders', async (req, res) => {
 // contact — useful right after a contact gets saved/synced, or if a PN/LID
 // mapping wasn't known yet at the time the task was created.
 tasksRouter.post('/tasks/relink-contacts', async (req, res) => {
-  const sock = getPrimarySocket()
   const organizationId = req.user?.organizationId ?? undefined
   let relinked = 0
 
-  if (sock) {
-    let orphanedQuery = db.selectFrom('tasks').select(['id', 'recipient_jid']).where('contact_id', 'is', null)
-    if (organizationId !== undefined) {
-      orphanedQuery = orphanedQuery.where('organization_id', '=', organizationId)
-    }
-    const orphaned = await orphanedQuery.execute()
-
-    for (const task of orphaned) {
-      const contactId = await resolveContactId(sock, task.recipient_jid)
-      if (contactId) {
-        await db.updateTable('tasks').set({ contact_id: contactId, updated_at: new Date() }).where('id', '=', task.id).execute()
-        relinked++
-      }
-    }
-
-    await recordAuditLog({
-      userId: req.user?.id ?? null,
-      action: 'tasks_relinked_contacts',
-      entityType: 'task',
-      metadata: { checked: orphaned.length, relinked },
-      ipAddress: req.ip
-    })
+  let orphanedQuery = db.selectFrom('tasks').select(['id', 'recipient_jid', 'organization_id']).where('contact_id', 'is', null)
+  if (organizationId !== undefined) {
+    orphanedQuery = orphanedQuery.where('organization_id', '=', organizationId)
   }
+  const orphaned = await orphanedQuery.execute()
+
+  let checked = 0
+  for (const task of orphaned) {
+    // Each task keeps its own organization's socket — a super admin's
+    // unscoped sweep can touch tasks from several organizations at once, and
+    // each one must only ever be resolved through its own org's session.
+    if (task.organization_id === null) continue
+    const sock = getPrimarySocketForOrganization(task.organization_id)
+    if (!sock) continue
+    checked++
+
+    const contactId = await resolveContactId(sock, task.recipient_jid, task.organization_id)
+    if (contactId) {
+      await db.updateTable('tasks').set({ contact_id: contactId, updated_at: new Date() }).where('id', '=', task.id).execute()
+      relinked++
+    }
+  }
+
+  await recordAuditLog({
+    userId: req.user?.id ?? null,
+    action: 'tasks_relinked_contacts',
+    entityType: 'task',
+    metadata: { checked, relinked },
+    ipAddress: req.ip
+  })
 
   res.json({ relinked })
 })

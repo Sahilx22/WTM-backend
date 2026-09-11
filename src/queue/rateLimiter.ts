@@ -9,17 +9,18 @@ function randomInt(min: number, max: number): number {
   return Math.floor(Math.random() * (max - min + 1)) + min
 }
 
-async function loadConfig() {
-  return db.selectFrom('rate_limit_config').selectAll().where('id', '=', 1).executeTakeFirstOrThrow()
+async function loadConfig(organizationId: number) {
+  return db.selectFrom('rate_limit_config').selectAll().where('organization_id', '=', organizationId).executeTakeFirstOrThrow()
 }
 
-export async function getRateLimitConfig() {
-  return loadConfig()
+export async function getRateLimitConfig(organizationId: number) {
+  return loadConfig(organizationId)
 }
 
-export async function getRollingSendCounts(): Promise<{ perMinute: number; perHour: number }> {
+export async function getRollingSendCounts(organizationId: number): Promise<{ perMinute: number; perHour: number }> {
   const row = await db
     .selectFrom('messages')
+    .where('organization_id', '=', organizationId)
     .select((eb) => [
       eb.fn
         .count<number>('id')
@@ -40,28 +41,31 @@ export interface RateOverride {
   maxDelayMs?: number
 }
 
-// Waits until the queue is unpaused and there's rolling-window capacity, then
-// applies a randomized inter-send delay. This is the one place send timing is
-// controlled — Baileys itself imposes no documented rate, so this is our own
-// safety margin against WhatsApp's anti-spam systems.
+// Waits until this organization's own queue is unpaused and has rolling-
+// window capacity, then applies a randomized inter-send delay. This is the
+// one place send timing is controlled — Baileys itself imposes no documented
+// rate, so this is our own safety margin against WhatsApp's anti-spam
+// systems. Every organization has its own independent limits/pause state
+// (see migration 036) — one org sending heavily, failing repeatedly, or
+// being paused never throttles or pauses any other organization's sends.
 //
 // A campaign may narrow its own delay window (e.g. to go slower than the
-// global default for a sensitive audience), but never faster than the global
-// floor — the override can only make sending more conservative.
-export async function waitForSendSlot(override?: RateOverride | null): Promise<void> {
+// org's default for a sensitive audience), but never faster than the org's
+// own floor — the override can only make sending more conservative.
+export async function waitForSendSlot(organizationId: number, override?: RateOverride | null): Promise<void> {
   // eslint-disable-next-line no-constant-condition
   while (true) {
-    const cfg = await loadConfig()
+    const cfg = await loadConfig(organizationId)
     if (!cfg.is_paused) break
     await sleep(5000)
   }
 
   // eslint-disable-next-line no-constant-condition
   while (true) {
-    const cfg = await loadConfig()
+    const cfg = await loadConfig(organizationId)
     if (cfg.is_paused) continue // dropped back into paused state while waiting for capacity
 
-    const { perMinute, perHour } = await getRollingSendCounts()
+    const { perMinute, perHour } = await getRollingSendCounts(organizationId)
 
     if (perMinute < cfg.max_per_minute && perHour < cfg.max_per_hour) {
       const minDelay = Math.max(cfg.min_delay_ms, override?.minDelayMs ?? cfg.min_delay_ms)
@@ -75,26 +79,27 @@ export async function waitForSendSlot(override?: RateOverride | null): Promise<v
   }
 }
 
-let consecutiveFailures = 0
+const consecutiveFailuresByOrg = new Map<number, number>()
 
-export async function recordSendOutcome(success: boolean): Promise<void> {
+export async function recordSendOutcome(organizationId: number, success: boolean): Promise<void> {
   if (success) {
-    consecutiveFailures = 0
+    consecutiveFailuresByOrg.set(organizationId, 0)
     return
   }
 
-  consecutiveFailures += 1
-  const cfg = await loadConfig()
+  const failures = (consecutiveFailuresByOrg.get(organizationId) ?? 0) + 1
+  consecutiveFailuresByOrg.set(organizationId, failures)
+  const cfg = await loadConfig(organizationId)
 
-  if (consecutiveFailures >= cfg.pause_after_consecutive_failures && !cfg.is_paused) {
+  if (failures >= cfg.pause_after_consecutive_failures && !cfg.is_paused) {
     await db
       .updateTable('rate_limit_config')
       .set({ is_paused: true, updated_at: new Date() })
-      .where('id', '=', 1)
+      .where('organization_id', '=', organizationId)
       .execute()
   }
 }
 
-export function resetConsecutiveFailureCounter(): void {
-  consecutiveFailures = 0
+export function resetConsecutiveFailureCounter(organizationId: number): void {
+  consecutiveFailuresByOrg.set(organizationId, 0)
 }

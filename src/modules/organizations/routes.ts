@@ -67,6 +67,12 @@ organizationsRouter.post('/organizations', requireSuperAdmin, async (req, res) =
       .returning(['id', 'username', 'display_name'])
       .executeTakeFirstOrThrow()
 
+    // Every organization gets its own independent rate-limit and
+    // task-settings row (see migrations 036/037) — column defaults cover
+    // every field, so this just needs to exist.
+    await trx.insertInto('rate_limit_config').values({ organization_id: organization.id }).execute()
+    await trx.insertInto('task_settings').values({ organization_id: organization.id }).execute()
+
     return { organization, user }
   })
 

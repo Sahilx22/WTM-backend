@@ -27,8 +27,15 @@ const csvUpload = multer({
 
 contactsRouter.get('/contacts', async (req, res) => {
   const search = typeof req.query.search === 'string' ? req.query.search : ''
+  const organizationId = req.user?.organizationId ?? undefined
 
   let query = db.selectFrom('contacts').selectAll().orderBy('display_name', 'asc').orderBy('phone_number', 'asc').limit(200)
+
+  // Regular org users only ever see their own organization's contacts; the
+  // super admin (no organization) gets the unscoped, cross-org view.
+  if (organizationId !== undefined) {
+    query = query.where('organization_id', '=', organizationId)
+  }
 
   if (search.trim()) {
     const like = `%${search.trim()}%`
@@ -43,7 +50,9 @@ contactsRouter.get('/contacts', async (req, res) => {
 
 contactsRouter.get('/contacts/:id', async (req, res) => {
   const id = Number(req.params.id)
-  const contact = await db.selectFrom('contacts').selectAll().where('id', '=', id).executeTakeFirst()
+  let query = db.selectFrom('contacts').selectAll().where('id', '=', id)
+  if (req.user?.organizationId) query = query.where('organization_id', '=', req.user.organizationId)
+  const contact = await query.executeTakeFirst()
   if (!contact) {
     res.status(404).json({ error: 'Contact not found.' })
     return
@@ -64,11 +73,12 @@ contactsRouter.post('/contacts', async (req, res) => {
     return
   }
 
-  const existing = await db
-    .selectFrom('contacts')
-    .select('id')
-    .where('phone_number', '=', digits)
-    .executeTakeFirst()
+  const organizationId = req.user?.organizationId ?? null
+
+  let existingQuery = db.selectFrom('contacts').select('id').where('phone_number', '=', digits)
+  existingQuery =
+    organizationId !== null ? existingQuery.where('organization_id', '=', organizationId) : existingQuery.where('organization_id', 'is', null)
+  const existing = await existingQuery.executeTakeFirst()
   if (existing) {
     res.status(400).json({ error: 'A contact with this phone number already exists.' })
     return
@@ -81,7 +91,8 @@ contactsRouter.post('/contacts', async (req, res) => {
       display_name: parsed.data.display_name,
       notes: parsed.data.notes,
       source: 'manual',
-      created_by: req.user?.id ?? null
+      created_by: req.user?.id ?? null,
+      organization_id: organizationId
     })
     .returning('id')
     .executeTakeFirstOrThrow()
@@ -112,18 +123,18 @@ contactsRouter.put('/contacts/:id', async (req, res) => {
     return
   }
 
-  const conflict = await db
-    .selectFrom('contacts')
-    .select('id')
-    .where('phone_number', '=', digits)
-    .where('id', '!=', id)
-    .executeTakeFirst()
+  const organizationId = req.user?.organizationId ?? null
+
+  let conflictQuery = db.selectFrom('contacts').select('id').where('phone_number', '=', digits).where('id', '!=', id)
+  conflictQuery =
+    organizationId !== null ? conflictQuery.where('organization_id', '=', organizationId) : conflictQuery.where('organization_id', 'is', null)
+  const conflict = await conflictQuery.executeTakeFirst()
   if (conflict) {
     res.status(400).json({ error: 'Another contact already uses this phone number.' })
     return
   }
 
-  await db
+  let updateQuery = db
     .updateTable('contacts')
     .set({
       phone_number: digits,
@@ -132,7 +143,8 @@ contactsRouter.put('/contacts/:id', async (req, res) => {
       updated_at: new Date()
     })
     .where('id', '=', id)
-    .execute()
+  if (organizationId !== null) updateQuery = updateQuery.where('organization_id', '=', organizationId)
+  await updateQuery.execute()
 
   await recordAuditLog({
     userId: req.user?.id ?? null,
@@ -147,7 +159,9 @@ contactsRouter.put('/contacts/:id', async (req, res) => {
 
 contactsRouter.delete('/contacts/:id', async (req, res) => {
   const id = Number(req.params.id)
-  await db.deleteFrom('contacts').where('id', '=', id).execute()
+  let deleteQuery = db.deleteFrom('contacts').where('id', '=', id)
+  if (req.user?.organizationId) deleteQuery = deleteQuery.where('organization_id', '=', req.user.organizationId)
+  await deleteQuery.execute()
 
   await recordAuditLog({
     userId: req.user?.id ?? null,
@@ -172,7 +186,11 @@ contactsRouter.post('/contacts/import/preview', csvUpload.single('file'), async 
 
   let parsed: ReturnType<typeof parseCsvBuffer>
   try {
-    const existingRows = await db.selectFrom('contacts').select('phone_number').execute()
+    const organizationId = req.user?.organizationId ?? null
+    let existingQuery = db.selectFrom('contacts').select('phone_number')
+    existingQuery =
+      organizationId !== null ? existingQuery.where('organization_id', '=', organizationId) : existingQuery.where('organization_id', 'is', null)
+    const existingRows = await existingQuery.execute()
     const existingSet = new Set(existingRows.map((r) => r.phone_number))
     parsed = parseCsvBuffer(req.file.buffer, existingSet)
   } catch (err) {
@@ -201,7 +219,10 @@ contactsRouter.post('/contacts/import/preview', csvUpload.single('file'), async 
     )
     .execute()
 
-  const batches = await db.selectFrom('batches').select(['id', 'name']).orderBy('name', 'asc').execute()
+  const organizationIdForBatches = req.user?.organizationId ?? undefined
+  let batchesQuery = db.selectFrom('batches').select(['id', 'name']).orderBy('name', 'asc')
+  if (organizationIdForBatches !== undefined) batchesQuery = batchesQuery.where('organization_id', '=', organizationIdForBatches)
+  const batches = await batchesQuery.execute()
 
   res.json({
     importId,
@@ -237,6 +258,8 @@ contactsRouter.post('/contacts/import/confirm', async (req, res) => {
     .where('validity', '=', 'valid')
     .execute()
 
+  const organizationIdForBatch = req.user?.organizationId ?? null
+
   const result = await db.transaction().execute(async (trx) => {
     let batchId: number
 
@@ -245,19 +268,29 @@ contactsRouter.post('/contacts/import/confirm', async (req, res) => {
       if (!name) throw new Error('Enter a name for the new batch.')
       const created = await trx
         .insertInto('batches')
-        .values({ name, created_by: req.user?.id ?? null })
+        .values({ name, created_by: req.user?.id ?? null, organization_id: organizationIdForBatch })
         .returning('id')
         .executeTakeFirstOrThrow()
       batchId = created.id
     } else {
       const id = Number(existing_batch_id)
       if (!Number.isInteger(id)) throw new Error('Choose a batch to import into.')
-      batchId = id
+      // Never trust existing_batch_id from the request body at face value —
+      // it must be one of this organization's own batches.
+      let ownedBatchQuery = trx.selectFrom('batches').select('id').where('id', '=', id)
+      ownedBatchQuery =
+        organizationIdForBatch !== null
+          ? ownedBatchQuery.where('organization_id', '=', organizationIdForBatch)
+          : ownedBatchQuery.where('organization_id', 'is', null)
+      const ownedBatch = await ownedBatchQuery.executeTakeFirst()
+      if (!ownedBatch) throw new Error('Choose a valid batch to import into.')
+      batchId = ownedBatch.id
     }
 
     let importedCount = 0
 
     if (validStagedRows.length > 0) {
+      const organizationId = req.user?.organizationId ?? null
       const insertedContacts = await trx
         .insertInto('contacts')
         .values(
@@ -265,10 +298,16 @@ contactsRouter.post('/contacts/import/confirm', async (req, res) => {
             phone_number: row.phone_number as string,
             display_name: row.display_name,
             source: 'csv' as const,
-            created_by: req.user?.id ?? null
+            created_by: req.user?.id ?? null,
+            organization_id: organizationId
           }))
         )
-        .onConflict((oc) => oc.column('phone_number').doUpdateSet({ updated_at: new Date() }))
+        // Postgres never treats two NULLs as conflicting under a unique
+        // constraint, so a super admin (organizationId null) re-importing
+        // the same number won't hit this de-dupe path — acceptable, since
+        // contact management is meant to happen from within an org, not the
+        // super admin panel.
+        .onConflict((oc) => oc.columns(['organization_id', 'phone_number']).doUpdateSet({ updated_at: new Date() }))
         .returning(['id'])
         .execute()
 

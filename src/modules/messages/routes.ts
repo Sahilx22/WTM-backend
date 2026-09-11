@@ -3,7 +3,7 @@ import { db } from '../../db/index.js'
 import { sendMessageSchema } from './schemas.js'
 import { mediaUpload, getMediaSignedUrl } from '../../lib/mediaUpload.js'
 import { recordAuditLog } from '../../lib/auditLog.js'
-import { getPrimarySocket } from '../../whatsapp/connectionManager.js'
+import { getPrimarySocketForOrganization } from '../../whatsapp/connectionManager.js'
 import { enqueueSendJob } from '../../queue/boss.js'
 import { resolveRecipients, resolveMedia } from './shared.js'
 
@@ -11,12 +11,18 @@ export const messagesRouter = Router()
 
 const MAX_RECIPIENTS_PER_SEND = 50
 
-async function loadFormData(templateId?: number | null) {
-  const [contacts, groups, templateRows] = await Promise.all([
-    db.selectFrom('contacts').selectAll().orderBy('display_name', 'asc').orderBy('phone_number', 'asc').limit(500).execute(),
-    db.selectFrom('groups').selectAll().orderBy('subject', 'asc').execute(),
-    db.selectFrom('message_templates').selectAll().orderBy('name', 'asc').execute()
-  ])
+async function loadFormData(templateId: number | null | undefined, organizationId: number | undefined) {
+  let contactsQuery = db.selectFrom('contacts').selectAll().orderBy('display_name', 'asc').orderBy('phone_number', 'asc').limit(500)
+  let groupsQuery = db.selectFrom('groups').selectAll().orderBy('subject', 'asc')
+  let templatesQuery = db.selectFrom('message_templates').selectAll().orderBy('name', 'asc')
+
+  if (organizationId !== undefined) {
+    contactsQuery = contactsQuery.where('organization_id', '=', organizationId)
+    groupsQuery = groupsQuery.where('organization_id', '=', organizationId)
+    templatesQuery = templatesQuery.where('organization_id', '=', organizationId)
+  }
+
+  const [contacts, groups, templateRows] = await Promise.all([contactsQuery.execute(), groupsQuery.execute(), templatesQuery.execute()])
 
   const templates = await Promise.all(
     templateRows.map(async (t) => ({ ...t, mediaUrl: t.media_path ? await getMediaSignedUrl(t.media_path) : null }))
@@ -29,7 +35,7 @@ async function loadFormData(templateId?: number | null) {
 
 messagesRouter.get('/send', async (req, res) => {
   const templateId = req.query.template_id ? Number(req.query.template_id) : null
-  const formData = await loadFormData(templateId)
+  const formData = await loadFormData(templateId, req.user?.organizationId ?? undefined)
 
   res.json(formData)
 })
@@ -46,21 +52,31 @@ messagesRouter.post('/send', mediaUpload.single('file'), async (req, res) => {
     return
   }
 
+  const organizationId = req.user?.organizationId
+  if (!organizationId) {
+    fail('Only an organization account can send messages.')
+    return
+  }
+
   const { recipient_type, contact_ids, raw_numbers, group_ids, message_type, message_text, template_id } =
     parsed.data
 
-  const sock = getPrimarySocket()
+  const sock = getPrimarySocketForOrganization(organizationId)
   if (!sock) {
     fail('WhatsApp is not connected. Connect it from the WhatsApp Connection page first.')
     return
   }
 
-  const { recipients, skipped } = await resolveRecipients(sock, {
-    recipientType: recipient_type,
-    contactIds: contact_ids,
-    rawNumbers: raw_numbers,
-    groupIds: group_ids
-  })
+  const { recipients, skipped } = await resolveRecipients(
+    sock,
+    {
+      recipientType: recipient_type,
+      contactIds: contact_ids,
+      rawNumbers: raw_numbers,
+      groupIds: group_ids
+    },
+    organizationId
+  )
 
   if (recipients.length === 0) {
     fail('No valid recipients were resolved. Check the numbers/contacts/groups you selected.')
@@ -79,7 +95,7 @@ messagesRouter.post('/send', mediaUpload.single('file'), async (req, res) => {
     return
   }
 
-  const mediaResult = await resolveMedia(message_type, req.file, template_id)
+  const mediaResult = await resolveMedia(message_type, req.file, template_id, organizationId)
   if (!mediaResult.ok) {
     fail(mediaResult.error)
     return
@@ -98,7 +114,8 @@ messagesRouter.post('/send', mediaUpload.single('file'), async (req, res) => {
         media_path: mediaResult.media.mediaPath,
         template_id,
         status: 'queued' as const,
-        created_by: req.user?.id ?? null
+        created_by: req.user?.id ?? null,
+        organization_id: organizationId
       }))
     )
     .returning('id')

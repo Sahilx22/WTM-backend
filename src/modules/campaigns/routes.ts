@@ -3,31 +3,37 @@ import { db } from '../../db/index.js'
 import { campaignInputSchema } from './schemas.js'
 import { mediaUpload, getMediaSignedUrl } from '../../lib/mediaUpload.js'
 import { recordAuditLog } from '../../lib/auditLog.js'
-import { getPrimarySocket } from '../../whatsapp/connectionManager.js'
+import { getPrimarySocketForOrganization } from '../../whatsapp/connectionManager.js'
 import { enqueueSendJob, cancelSendJob } from '../../queue/boss.js'
 import { resolveBatchRecipients, resolveMedia } from '../messages/shared.js'
 import { campaignEvents } from '../../queue/campaignProgress.js'
 
 export const campaignsRouter = Router()
 
-async function loadFormData() {
-  const [batches, templateRows] = await Promise.all([
-    db.selectFrom('batches').selectAll().orderBy('name', 'asc').execute(),
-    db.selectFrom('message_templates').selectAll().orderBy('name', 'asc').execute()
-  ])
+async function loadFormData(organizationId: number | undefined) {
+  let batchesQuery = db.selectFrom('batches').selectAll().orderBy('name', 'asc')
+  let templatesQuery = db.selectFrom('message_templates').selectAll().orderBy('name', 'asc')
+  if (organizationId !== undefined) {
+    batchesQuery = batchesQuery.where('organization_id', '=', organizationId)
+    templatesQuery = templatesQuery.where('organization_id', '=', organizationId)
+  }
+  const [batches, templateRows] = await Promise.all([batchesQuery.execute(), templatesQuery.execute()])
   const templates = await Promise.all(
     templateRows.map(async (t) => ({ ...t, mediaUrl: t.media_path ? await getMediaSignedUrl(t.media_path) : null }))
   )
   return { batches, templates }
 }
 
-campaignsRouter.get('/campaigns', async (_req, res) => {
-  const campaigns = await db.selectFrom('campaigns').selectAll().orderBy('created_at', 'desc').execute()
+campaignsRouter.get('/campaigns', async (req, res) => {
+  const organizationId = req.user?.organizationId ?? undefined
+  let query = db.selectFrom('campaigns').selectAll().orderBy('created_at', 'desc')
+  if (organizationId !== undefined) query = query.where('organization_id', '=', organizationId)
+  const campaigns = await query.execute()
   res.json({ campaigns })
 })
 
-campaignsRouter.get('/campaigns/new', async (_req, res) => {
-  const formData = await loadFormData()
+campaignsRouter.get('/campaigns/new', async (req, res) => {
+  const formData = await loadFormData(req.user?.organizationId ?? undefined)
   res.json(formData)
 })
 
@@ -43,6 +49,12 @@ campaignsRouter.post('/campaigns', mediaUpload.single('file'), async (req, res) 
     return
   }
 
+  const organizationId = req.user?.organizationId
+  if (!organizationId) {
+    fail('Only an organization account can create campaigns.')
+    return
+  }
+
   const {
     name,
     batch_id,
@@ -55,7 +67,14 @@ campaignsRouter.post('/campaigns', mediaUpload.single('file'), async (req, res) 
     max_delay_ms
   } = parsed.data
 
-  const batch = await db.selectFrom('batches').select(['id', 'contact_count']).where('id', '=', batch_id).executeTakeFirst()
+  // Never trust batch_id from the request body at face value — it must be
+  // one of this organization's own batches.
+  const batch = await db
+    .selectFrom('batches')
+    .select(['id', 'contact_count'])
+    .where('id', '=', batch_id)
+    .where('organization_id', '=', organizationId)
+    .executeTakeFirst()
   if (!batch) {
     fail('Choose a valid batch.')
     return
@@ -70,7 +89,7 @@ campaignsRouter.post('/campaigns', mediaUpload.single('file'), async (req, res) 
     return
   }
 
-  const mediaResult = await resolveMedia(message_type, req.file, template_id)
+  const mediaResult = await resolveMedia(message_type, req.file, template_id, organizationId)
   if (!mediaResult.ok) {
     fail(mediaResult.error)
     return
@@ -85,13 +104,13 @@ campaignsRouter.post('/campaigns', mediaUpload.single('file'), async (req, res) 
     }
   }
 
-  const sock = getPrimarySocket()
+  const sock = getPrimarySocketForOrganization(organizationId)
   if (!sock) {
     fail('WhatsApp is not connected. Connect it from the WhatsApp Connection page first.')
     return
   }
 
-  const { recipients, skipped } = await resolveBatchRecipients(sock, batch_id)
+  const { recipients, skipped } = await resolveBatchRecipients(sock, batch_id, organizationId)
   if (recipients.length === 0) {
     fail('No valid WhatsApp recipients were found in that batch.')
     return
@@ -116,7 +135,8 @@ campaignsRouter.post('/campaigns', mediaUpload.single('file'), async (req, res) 
       rate_limit_override: rateOverride,
       total_recipients: recipients.length,
       created_by: req.user?.id ?? null,
-      started_at: scheduledAt ? null : new Date()
+      started_at: scheduledAt ? null : new Date(),
+      organization_id: organizationId
     })
     .returning('id')
     .executeTakeFirstOrThrow()
@@ -138,7 +158,8 @@ campaignsRouter.post('/campaigns', mediaUpload.single('file'), async (req, res) 
         template_id,
         status: initialStatus,
         scheduled_at: scheduledAt,
-        created_by: req.user?.id ?? null
+        created_by: req.user?.id ?? null,
+        organization_id: organizationId
       }))
     )
     .returning('id')
@@ -178,9 +199,16 @@ function computeProgress(campaign: {
   return { campaign, pct }
 }
 
+async function findOwnedCampaign(id: number, organizationId: number | undefined) {
+  let query = db.selectFrom('campaigns').selectAll().where('id', '=', id)
+  if (organizationId !== undefined) query = query.where('organization_id', '=', organizationId)
+  return query.executeTakeFirst()
+}
+
 campaignsRouter.get('/campaigns/:id', async (req, res) => {
   const id = Number(req.params.id)
-  const campaign = await db.selectFrom('campaigns').selectAll().where('id', '=', id).executeTakeFirst()
+  const organizationId = req.user?.organizationId ?? undefined
+  const campaign = await findOwnedCampaign(id, organizationId)
   if (!campaign) {
     res.status(404).json({ error: 'Campaign not found.' })
     return
@@ -200,21 +228,25 @@ campaignsRouter.get('/campaigns/:id', async (req, res) => {
   res.json({ campaign: { ...campaign, mediaUrl }, progress: { pct }, recentMessages })
 })
 
-async function loadProgressSnapshot(campaignId: number) {
-  const campaign = await db.selectFrom('campaigns').selectAll().where('id', '=', campaignId).executeTakeFirst()
+async function loadProgressSnapshot(campaignId: number, organizationId: number | undefined) {
+  const campaign = await findOwnedCampaign(campaignId, organizationId)
   if (!campaign) return null
   return computeProgress(campaign)
 }
 
 campaignsRouter.get('/campaigns/:id/stream', (req, res) => {
   const id = Number(req.params.id)
+  // Captured once at stream setup — every subsequent tick re-checks the
+  // campaign still belongs to this same organization before writing
+  // anything to the response.
+  const organizationId = req.user?.organizationId ?? undefined
 
   res.set({ 'Content-Type': 'text/event-stream', 'Cache-Control': 'no-cache', Connection: 'keep-alive' })
   res.flushHeaders()
 
   const send = async () => {
     try {
-      const snapshot = await loadProgressSnapshot(id)
+      const snapshot = await loadProgressSnapshot(id, organizationId)
       if (!snapshot) return
       res.write(`event: message\ndata: ${JSON.stringify(snapshot)}\n\n`)
     } catch {
@@ -239,6 +271,12 @@ campaignsRouter.get('/campaigns/:id/stream', (req, res) => {
 
 campaignsRouter.post('/campaigns/:id/cancel', async (req, res) => {
   const id = Number(req.params.id)
+  const organizationId = req.user?.organizationId ?? undefined
+  const campaign = await findOwnedCampaign(id, organizationId)
+  if (!campaign) {
+    res.status(404).json({ error: 'Campaign not found.' })
+    return
+  }
 
   const pending = await db
     .selectFrom('messages')

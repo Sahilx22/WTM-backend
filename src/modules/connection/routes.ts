@@ -5,7 +5,7 @@ import {
   createSession,
   deleteSession,
   getMaxSessions,
-  getPrimarySocket,
+  getPrimarySocketForOrganization,
   listSessionsForOrganization,
   maskPhoneNumber,
   requestConnect,
@@ -178,8 +178,10 @@ connectionRouter.delete('/connection/sessions/:id', async (req, res) => {
   }
 })
 
-// Diagnostic only — confirms whether *any* organization currently has a
-// connected primary session (the one reminders/auto-reports go through).
-connectionRouter.get('/connection/primary-status', (_req, res) => {
-  res.json({ connected: getPrimarySocket() !== null })
+// Diagnostic only — confirms whether *this caller's own organization*
+// currently has a connected primary session (the one reminders/auto-reports
+// go through). A super admin (no organization) has none of its own.
+connectionRouter.get('/connection/primary-status', (req, res) => {
+  const organizationId = req.user?.organizationId
+  res.json({ connected: organizationId ? getPrimarySocketForOrganization(organizationId) !== null : false })
 })

@@ -11,15 +11,25 @@ async function withMediaUrl<T extends { media_path: string | null }>(template: T
   return { ...template, mediaUrl }
 }
 
-templatesRouter.get('/templates', async (_req, res) => {
-  const rows = await db.selectFrom('message_templates').selectAll().orderBy('created_at', 'desc').execute()
+templatesRouter.get('/templates', async (req, res) => {
+  const organizationId = req.user?.organizationId ?? undefined
+  let query = db.selectFrom('message_templates').selectAll().orderBy('created_at', 'desc')
+  // Regular org users only ever see their own organization's templates; the
+  // super admin (no organization) gets the unscoped, cross-org view.
+  if (organizationId !== undefined) {
+    query = query.where('organization_id', '=', organizationId)
+  }
+  const rows = await query.execute()
   const templates = await Promise.all(rows.map(withMediaUrl))
   res.json({ templates })
 })
 
 templatesRouter.get('/templates/:id', async (req, res) => {
   const id = Number(req.params.id)
-  const row = await db.selectFrom('message_templates').selectAll().where('id', '=', id).executeTakeFirst()
+  const organizationId = req.user?.organizationId
+  let query = db.selectFrom('message_templates').selectAll().where('id', '=', id)
+  if (organizationId) query = query.where('organization_id', '=', organizationId)
+  const row = await query.executeTakeFirst()
   if (!row) {
     res.status(404).json({ error: 'Template not found.' })
     return
@@ -70,7 +80,8 @@ templatesRouter.post('/templates', mediaUpload.single('file'), async (req, res) 
       body_text,
       media_path: mediaPath,
       media_mimetype: mediaMimetype,
-      created_by: req.user?.id ?? null
+      created_by: req.user?.id ?? null,
+      organization_id: req.user?.organizationId ?? null
     })
     .returning('id')
     .executeTakeFirstOrThrow()
@@ -88,7 +99,10 @@ templatesRouter.post('/templates', mediaUpload.single('file'), async (req, res) 
 
 templatesRouter.put('/templates/:id', mediaUpload.single('file'), async (req, res) => {
   const id = Number(req.params.id)
-  const existing = await db.selectFrom('message_templates').selectAll().where('id', '=', id).executeTakeFirst()
+  const organizationId = req.user?.organizationId
+  let existingQuery = db.selectFrom('message_templates').selectAll().where('id', '=', id)
+  if (organizationId) existingQuery = existingQuery.where('organization_id', '=', organizationId)
+  const existing = await existingQuery.executeTakeFirst()
   if (!existing) {
     res.status(404).json({ error: 'Template not found.' })
     return
@@ -135,7 +149,7 @@ templatesRouter.put('/templates/:id', mediaUpload.single('file'), async (req, re
     return
   }
 
-  await db
+  let updateQuery = db
     .updateTable('message_templates')
     .set({
       name,
@@ -146,7 +160,8 @@ templatesRouter.put('/templates/:id', mediaUpload.single('file'), async (req, re
       updated_at: new Date()
     })
     .where('id', '=', id)
-    .execute()
+  if (organizationId) updateQuery = updateQuery.where('organization_id', '=', organizationId)
+  await updateQuery.execute()
 
   await recordAuditLog({
     userId: req.user?.id ?? null,
@@ -161,22 +176,25 @@ templatesRouter.put('/templates/:id', mediaUpload.single('file'), async (req, re
 
 templatesRouter.delete('/templates/:id', async (req, res) => {
   const id = Number(req.params.id)
-  const existing = await db
-    .selectFrom('message_templates')
-    .select(['media_path'])
-    .where('id', '=', id)
-    .executeTakeFirst()
+  const organizationId = req.user?.organizationId
+  let existingQuery = db.selectFrom('message_templates').select(['media_path']).where('id', '=', id)
+  if (organizationId) existingQuery = existingQuery.where('organization_id', '=', organizationId)
+  const existing = await existingQuery.executeTakeFirst()
 
-  await db.deleteFrom('message_templates').where('id', '=', id).execute()
-  if (existing?.media_path) deleteUploadedFile(existing.media_path)
+  if (existing) {
+    let deleteQuery = db.deleteFrom('message_templates').where('id', '=', id)
+    if (organizationId) deleteQuery = deleteQuery.where('organization_id', '=', organizationId)
+    await deleteQuery.execute()
+    if (existing.media_path) deleteUploadedFile(existing.media_path)
 
-  await recordAuditLog({
-    userId: req.user?.id ?? null,
-    action: 'template_deleted',
-    entityType: 'message_template',
-    entityId: id,
-    ipAddress: req.ip
-  })
+    await recordAuditLog({
+      userId: req.user?.id ?? null,
+      action: 'template_deleted',
+      entityType: 'message_template',
+      entityId: id,
+      ipAddress: req.ip
+    })
+  }
 
   res.status(204).end()
 })

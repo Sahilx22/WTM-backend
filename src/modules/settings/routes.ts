@@ -4,25 +4,36 @@ import { rateLimitConfigSchema, taskSettingsSchema, brandingSchema } from './sch
 import { recordAuditLog } from '../../lib/auditLog.js'
 import { resetConsecutiveFailureCounter } from '../../queue/rateLimiter.js'
 import { restartOutgoingWorker } from '../../queue/outgoingWorker.js'
-import { applyAutoReportSchedules, loadTaskSettings } from '../../queue/autoReports.js'
-import { applyDigestSchedules } from '../../queue/scheduledDigests.js'
+import { loadTaskSettingsForOrganization } from '../../queue/autoReports.js'
+import { reapplySchedulesIfRunning } from '../../queue/lifecycle.js'
 
 export const settingsRouter = Router()
 
-async function loadConfig() {
-  return db.selectFrom('rate_limit_config').selectAll().where('id', '=', 1).executeTakeFirstOrThrow()
+// Every route below operates on the caller's own organization's settings
+// only — there is no longer a single shared config row (see migrations
+// 036/037), so a super admin (no organization) has no settings of its own to
+// read or change here.
+function requireOrganization(req: import('express').Request, res: import('express').Response): number | null {
+  if (!req.user?.organizationId) {
+    res.status(403).json({ error: 'No organization to manage settings for.' })
+    return null
+  }
+  return req.user.organizationId
+}
+
+async function loadConfig(organizationId: number) {
+  return db.selectFrom('rate_limit_config').selectAll().where('organization_id', '=', organizationId).executeTakeFirstOrThrow()
 }
 
 settingsRouter.get('/settings', async (req, res) => {
-  const [config, taskSettings] = await Promise.all([loadConfig(), loadTaskSettings()])
+  const organizationId = requireOrganization(req, res)
+  if (organizationId === null) return
 
-  const organization = req.user?.organizationId
-    ? await db
-        .selectFrom('organizations')
-        .select(['id', 'name', 'logo_url', 'admin_wa_number'])
-        .where('id', '=', req.user.organizationId)
-        .executeTakeFirst()
-    : null
+  const [config, taskSettings, organization] = await Promise.all([
+    loadConfig(organizationId),
+    loadTaskSettingsForOrganization(organizationId),
+    db.selectFrom('organizations').select(['id', 'name', 'logo_url', 'admin_wa_number']).where('id', '=', organizationId).executeTakeFirst()
+  ])
 
   res.json({
     config,
@@ -34,10 +45,8 @@ settingsRouter.get('/settings', async (req, res) => {
 })
 
 settingsRouter.post('/settings/branding', async (req, res) => {
-  if (!req.user?.organizationId) {
-    res.status(403).json({ error: 'No organization to update.' })
-    return
-  }
+  const organizationId = requireOrganization(req, res)
+  if (organizationId === null) return
 
   const parsed = brandingSchema.safeParse(req.body)
 
@@ -55,7 +64,7 @@ settingsRouter.post('/settings/branding', async (req, res) => {
       ...(logo_url !== undefined ? { logo_url: logo_url === '' ? null : logo_url } : {}),
       updated_at: new Date()
     })
-    .where('id', '=', req.user.organizationId)
+    .where('id', '=', organizationId)
     .returning(['id', 'name', 'logo_url', 'admin_wa_number'])
     .executeTakeFirstOrThrow()
 
@@ -74,6 +83,9 @@ settingsRouter.post('/settings/branding', async (req, res) => {
 })
 
 settingsRouter.post('/settings', async (req, res) => {
+  const organizationId = requireOrganization(req, res)
+  if (organizationId === null) return
+
   const parsed = rateLimitConfigSchema.safeParse(req.body)
 
   if (!parsed.success) {
@@ -81,12 +93,12 @@ settingsRouter.post('/settings', async (req, res) => {
     return
   }
 
-  const before = await loadConfig()
+  const before = await loadConfig(organizationId)
 
   await db
     .updateTable('rate_limit_config')
     .set({ ...parsed.data, updated_at: new Date(), updated_by: req.user?.id ?? null })
-    .where('id', '=', 1)
+    .where('organization_id', '=', organizationId)
     .execute()
 
   if (parsed.data.concurrency !== before.concurrency) {
@@ -101,18 +113,21 @@ settingsRouter.post('/settings', async (req, res) => {
     ipAddress: req.ip
   })
 
-  const config = await loadConfig()
+  const config = await loadConfig(organizationId)
   res.json({ config })
 })
 
 settingsRouter.post('/settings/unpause', async (req, res) => {
+  const organizationId = requireOrganization(req, res)
+  if (organizationId === null) return
+
   await db
     .updateTable('rate_limit_config')
     .set({ is_paused: false, updated_at: new Date(), updated_by: req.user?.id ?? null })
-    .where('id', '=', 1)
+    .where('organization_id', '=', organizationId)
     .execute()
 
-  resetConsecutiveFailureCounter()
+  resetConsecutiveFailureCounter(organizationId)
 
   await recordAuditLog({
     userId: req.user?.id ?? null,
@@ -121,11 +136,14 @@ settingsRouter.post('/settings/unpause', async (req, res) => {
     ipAddress: req.ip
   })
 
-  const config = await loadConfig()
+  const config = await loadConfig(organizationId)
   res.json({ config })
 })
 
 settingsRouter.post('/settings/tasks', async (req, res) => {
+  const organizationId = requireOrganization(req, res)
+  if (organizationId === null) return
+
   const parsed = taskSettingsSchema.safeParse(req.body)
 
   if (!parsed.success) {
@@ -136,12 +154,11 @@ settingsRouter.post('/settings/tasks', async (req, res) => {
   await db
     .updateTable('task_settings')
     .set({ ...parsed.data, updated_at: new Date(), updated_by: req.user?.id ?? null })
-    .where('id', '=', 1)
+    .where('organization_id', '=', organizationId)
     .execute()
 
-  const updated = await loadTaskSettings()
-  await applyAutoReportSchedules(updated)
-  await applyDigestSchedules(updated)
+  const updated = await loadTaskSettingsForOrganization(organizationId)
+  await reapplySchedulesIfRunning(organizationId, updated)
 
   await recordAuditLog({
     userId: req.user?.id ?? null,

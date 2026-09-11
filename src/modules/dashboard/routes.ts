@@ -6,16 +6,43 @@ import { getRateLimitConfig } from '../../queue/rateLimiter.js'
 
 export const dashboardRouter = Router()
 
+const DEFAULT_RATE_LIMIT_CONFIG = {
+  max_per_minute: 10,
+  max_per_hour: 200,
+  min_delay_ms: 3000,
+  max_delay_ms: 8000,
+  concurrency: 1,
+  pause_after_consecutive_failures: 5,
+  is_paused: false
+}
+
 dashboardRouter.get('/dashboard', async (req, res) => {
+  const organizationId = req.user?.organizationId ?? undefined
   const todayStart = sql<Date>`date_trunc('day', now())`
 
   // One aggregate query covers every messages-table stat the dashboard needs
   // (today's counts, the pending queue depth, and the rolling send-rate
   // windows) instead of six separate round trips — each FILTER clause scans
-  // the same result set Postgres already has to read once.
+  // the same result set Postgres already has to read once. Every query here
+  // is scoped to the caller's own organization; the super admin (no
+  // organization) gets the unscoped, cross-org view, same convention as
+  // tasks/contacts.
+  let messageStatsQuery = db.selectFrom('messages')
+  let totalContactsQuery = db.selectFrom('contacts')
+  let activeBatchesQuery = db.selectFrom('campaigns').where('status', 'in', ['scheduled', 'sending'])
+  let recentActivityQuery = db.selectFrom('messages').leftJoin('campaigns', 'campaigns.id', 'messages.campaign_id')
+  let lastSentQuery = db.selectFrom('messages').where('sent_at', 'is not', null)
+
+  if (organizationId !== undefined) {
+    messageStatsQuery = messageStatsQuery.where('organization_id', '=', organizationId)
+    totalContactsQuery = totalContactsQuery.where('organization_id', '=', organizationId)
+    activeBatchesQuery = activeBatchesQuery.where('organization_id', '=', organizationId)
+    recentActivityQuery = recentActivityQuery.where('messages.organization_id', '=', organizationId)
+    lastSentQuery = lastSentQuery.where('organization_id', '=', organizationId)
+  }
+
   const [messageStats, totalContacts, activeBatches, recentActivity, lastSent, rateLimitConfig] = await Promise.all([
-    db
-      .selectFrom('messages')
+    messageStatsQuery
       .select((eb) => [
         eb.fn.count<number>('id').filterWhere('sent_at', '>=', todayStart).as('sentToday'),
         eb.fn
@@ -37,15 +64,9 @@ dashboardRouter.get('/dashboard', async (req, res) => {
           .as('perHour')
       ])
       .executeTakeFirstOrThrow(),
-    db.selectFrom('contacts').select((eb) => eb.fn.countAll<number>().as('count')).executeTakeFirstOrThrow(),
-    db
-      .selectFrom('campaigns')
-      .select((eb) => eb.fn.count<number>('batch_id').distinct().as('count'))
-      .where('status', 'in', ['scheduled', 'sending'])
-      .executeTakeFirstOrThrow(),
-    db
-      .selectFrom('messages')
-      .leftJoin('campaigns', 'campaigns.id', 'messages.campaign_id')
+    totalContactsQuery.select((eb) => eb.fn.countAll<number>().as('count')).executeTakeFirstOrThrow(),
+    activeBatchesQuery.select((eb) => eb.fn.count<number>('batch_id').distinct().as('count')).executeTakeFirstOrThrow(),
+    recentActivityQuery
       .select([
         'messages.id',
         'messages.recipient_jid',
@@ -57,15 +78,13 @@ dashboardRouter.get('/dashboard', async (req, res) => {
       .orderBy('messages.updated_at', 'desc')
       .limit(10)
       .execute(),
-    db
-      .selectFrom('messages')
+    lastSentQuery
       .select(['recipient_jid', 'status', 'sent_at'])
-      .where('sent_at', 'is not', null)
       .orderBy('sent_at', 'desc')
       .orderBy('id', 'desc')
       .limit(1)
       .executeTakeFirst(),
-    getRateLimitConfig()
+    organizationId !== undefined ? getRateLimitConfig(organizationId) : Promise.resolve(DEFAULT_RATE_LIMIT_CONFIG)
   ])
 
   // The dashboard's connection tile shows this org's primary session (the

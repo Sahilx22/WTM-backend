@@ -13,6 +13,7 @@ historyRouter.get('/history', async (req, res) => {
   const dateFrom = typeof req.query.date_from === 'string' ? req.query.date_from : ''
   const dateTo = typeof req.query.date_to === 'string' ? req.query.date_to : ''
   const page = Math.max(1, Number(req.query.page) || 1)
+  const organizationId = req.user?.organizationId ?? undefined
 
   let query = db
     .selectFrom('messages')
@@ -36,6 +37,14 @@ historyRouter.get('/history', async (req, res) => {
     ])
 
   let countQuery = db.selectFrom('messages')
+
+  // Regular org users only ever see their own organization's message
+  // history; the super admin (no organization) gets the unscoped, cross-org
+  // view, same convention as tasks/contacts.
+  if (organizationId !== undefined) {
+    query = query.where('messages.organization_id', '=', organizationId)
+    countQuery = countQuery.where('organization_id', '=', organizationId)
+  }
 
   if (status) {
     query = query.where('messages.status', '=', status as never)
@@ -89,6 +98,21 @@ historyRouter.get('/history', async (req, res) => {
 
 historyRouter.get('/history/:id/attempts', async (req, res) => {
   const id = Number(req.params.id)
+  const organizationId = req.user?.organizationId ?? undefined
+
+  // Fold the org check into the message lookup itself — a wrong-org id just
+  // returns an empty list, same as the tasks/contacts pattern, rather than
+  // trusting the id alone.
+  let messageQuery = db.selectFrom('messages').select('id').where('id', '=', id)
+  if (organizationId !== undefined) {
+    messageQuery = messageQuery.where('organization_id', '=', organizationId)
+  }
+  const message = await messageQuery.executeTakeFirst()
+  if (!message) {
+    res.json({ messageId: id, attempts: [] })
+    return
+  }
+
   const attempts = await db
     .selectFrom('message_attempts')
     .selectAll()
