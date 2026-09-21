@@ -3,7 +3,11 @@ import { db } from '../../db/index.js'
 import { campaignInputSchema } from './schemas.js'
 import { mediaUpload, getMediaSignedUrl } from '../../lib/mediaUpload.js'
 import { recordAuditLog } from '../../lib/auditLog.js'
-import { getPrimarySocketForOrganization } from '../../whatsapp/connectionManager.js'
+import {
+  getConnectedSessionsForOrganization,
+  getConnectedSocketForSession,
+  maskPhoneNumber
+} from '../../whatsapp/connectionManager.js'
 import { enqueueSendJob, cancelSendJob } from '../../queue/boss.js'
 import { resolveBatchRecipients, resolveMedia } from '../messages/shared.js'
 import { campaignEvents } from '../../queue/campaignProgress.js'
@@ -21,7 +25,17 @@ async function loadFormData(organizationId: number | undefined) {
   const templates = await Promise.all(
     templateRows.map(async (t) => ({ ...t, mediaUrl: t.media_path ? await getMediaSignedUrl(t.media_path) : null }))
   )
-  return { batches, templates }
+  // Only sessions that are connected right now can be picked as the sender.
+  const sessions =
+    organizationId === undefined
+      ? []
+      : getConnectedSessionsForOrganization(organizationId).map((s) => ({
+          id: s.sessionId,
+          label: s.label,
+          phoneNumber: maskPhoneNumber(s.phoneNumber),
+          isPrimary: s.isPrimary
+        }))
+  return { batches, templates, sessions }
 }
 
 campaignsRouter.get('/campaigns', async (req, res) => {
@@ -63,6 +77,7 @@ campaignsRouter.post('/campaigns', mediaUpload.single('file'), async (req, res) 
     message_text,
     scheduled_date,
     scheduled_time,
+    whatsapp_session_id,
     min_delay_ms,
     max_delay_ms
   } = parsed.data
@@ -104,9 +119,27 @@ campaignsRouter.post('/campaigns', mediaUpload.single('file'), async (req, res) 
     }
   }
 
-  const sock = getPrimarySocketForOrganization(organizationId)
-  if (!sock) {
+  // Which linked WhatsApp sends this campaign. Never trust the id from the
+  // request body: it must be one of this organization's own sessions that is
+  // connected right now. With one connected session there is nothing to
+  // choose; with several and no choice made, the primary (listed first) is used.
+  const connectedSessions = getConnectedSessionsForOrganization(organizationId)
+  if (connectedSessions.length === 0) {
     fail('WhatsApp is not connected. Connect it from the WhatsApp Connection page first.')
+    return
+  }
+  let sender = connectedSessions[0]!
+  if (whatsapp_session_id !== null) {
+    const chosen = connectedSessions.find((s) => s.sessionId === whatsapp_session_id)
+    if (!chosen) {
+      fail('The selected WhatsApp is not connected right now. Choose a connected WhatsApp.')
+      return
+    }
+    sender = chosen
+  }
+  const sock = getConnectedSocketForSession(sender.sessionId, organizationId)
+  if (!sock) {
+    fail('The selected WhatsApp is not connected right now. Choose a connected WhatsApp.')
     return
   }
 
@@ -136,7 +169,8 @@ campaignsRouter.post('/campaigns', mediaUpload.single('file'), async (req, res) 
       total_recipients: recipients.length,
       created_by: req.user?.id ?? null,
       started_at: scheduledAt ? null : new Date(),
-      organization_id: organizationId
+      organization_id: organizationId,
+      whatsapp_session_id: sender.sessionId
     })
     .returning('id')
     .executeTakeFirstOrThrow()
@@ -175,7 +209,12 @@ campaignsRouter.post('/campaigns', mediaUpload.single('file'), async (req, res) 
     action: 'campaign_created',
     entityType: 'campaign',
     entityId: campaign.id,
-    metadata: { recipientCount: recipients.length, skippedCount: skipped.length, scheduled: Boolean(scheduledAt) },
+    metadata: {
+      recipientCount: recipients.length,
+      skippedCount: skipped.length,
+      scheduled: Boolean(scheduledAt),
+      whatsappSessionId: sender.sessionId
+    },
     ipAddress: req.ip
   })
 
@@ -225,7 +264,18 @@ campaignsRouter.get('/campaigns/:id', async (req, res) => {
   const { pct } = computeProgress(campaign)
   const mediaUrl = campaign.media_path ? await getMediaSignedUrl(campaign.media_path) : null
 
-  res.json({ campaign: { ...campaign, mediaUrl }, progress: { pct }, recentMessages })
+  // The WhatsApp number this campaign sends from (null for campaigns that
+  // predate the choice — those use the primary session).
+  const senderRow = campaign.whatsapp_session_id
+    ? await db
+        .selectFrom('whatsapp_sessions')
+        .select(['label', 'phone_number'])
+        .where('id', '=', campaign.whatsapp_session_id)
+        .executeTakeFirst()
+    : undefined
+  const sender = senderRow ? { label: senderRow.label, phoneNumber: maskPhoneNumber(senderRow.phone_number) } : null
+
+  res.json({ campaign: { ...campaign, mediaUrl }, progress: { pct }, recentMessages, sender })
 })
 
 async function loadProgressSnapshot(campaignId: number, organizationId: number | undefined) {

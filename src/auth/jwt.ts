@@ -8,6 +8,7 @@ export interface AuthTokenPayload {
   username: string
   organizationId: number | null
   isSuperAdmin: boolean
+  role: 'admin' | 'restricted'
 }
 
 export function signToken(payload: AuthTokenPayload): string {
@@ -23,7 +24,8 @@ export function verifyToken(token: string): AuthTokenPayload | null {
         id: Number(raw.id),
         username: String(raw.username),
         organizationId: raw.organizationId === null || raw.organizationId === undefined ? null : Number(raw.organizationId),
-        isSuperAdmin: Boolean(raw.isSuperAdmin)
+        isSuperAdmin: Boolean(raw.isSuperAdmin),
+        role: raw.role === 'restricted' ? 'restricted' : 'admin'
       }
     }
     return null

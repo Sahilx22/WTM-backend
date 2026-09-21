@@ -2,9 +2,10 @@ import { isPnUser, isLidUser, jidDecode, type WASocket, type WAMessage } from '@
 import pino from 'pino'
 import { db } from '../db/index.js'
 import { isProduction } from '../config/env.js'
-import { parseTaskMessage, isThumbsUp } from './taskParser.js'
+import { parseTaskMessage, isThumbsUp, isDoneReply } from './taskParser.js'
 import { scheduleNextReminder, cancelTaskReminder } from '../queue/taskReminders.js'
 import { recordAuditLog } from '../lib/auditLog.js'
+import { completeTask } from '../lib/taskCompletion.js'
 
 const logger = pino({ level: isProduction ? 'error' : 'warn' })
 
@@ -201,13 +202,18 @@ async function matchCandidateToParticipant(
 
 // Logs a WhatsApp quote-reply as a note against whichever task the quoted
 // message (the task's original #task message, or one of its reminders)
-// belongs to. Returns true if it matched a task and was logged, so the
+// belongs to, and — if the reply just says "done" (or a close variant, see
+// isDoneReply) — marks that task completed directly. A stronger, more
+// explicit signal than the thumbs-up reaction (which only moves pending ->
+// needs_review for the admin to double check): works the same way whether
+// it's the recipient replying from their own phone or the admin replying
+// from theirs. Returns true if it matched a task and was logged, so the
 // caller can skip treating the same text as anything else (e.g. a new
 // #task creation). `replierJid` identifies who's actually replying — needed
 // only when the quoted message created more than one task (see above); if
 // the admin themself replies to such a message there's no way to tell which
-// employee they mean, so the note is logged against all of them rather than
-// guessed at or silently dropped.
+// employee they mean, so the note (and a "done" completion) applies to all
+// of them rather than guessed at or silently dropped.
 async function logTaskNoteIfReply(
   sock: WASocket,
   quotedMessageId: string,
@@ -220,21 +226,33 @@ async function logTaskNoteIfReply(
   const candidates = await findTaskMessageCandidates(quotedMessageId, organizationId)
   if (candidates.length === 0) return false
 
-  let targetTaskIds: number[]
+  let targets: TaskCandidate[]
   if (candidates.length === 1) {
-    targetTaskIds = [candidates[0]!.id]
+    targets = [candidates[0]!]
   } else if (!fromAdmin) {
     const matched = await matchCandidateToParticipant(sock, candidates, replierJid)
-    targetTaskIds = matched ? [matched.id] : candidates.map((c) => c.id)
+    targets = matched ? [matched] : candidates
   } else {
-    targetTaskIds = candidates.map((c) => c.id)
+    targets = candidates
   }
 
-  for (const taskId of targetTaskIds) {
-    await db.insertInto('task_notes').values({ task_id: taskId, wa_message_id: waMessageId, from_admin: fromAdmin, body: text }).execute()
+  for (const target of targets) {
+    await db.insertInto('task_notes').values({ task_id: target.id, wa_message_id: waMessageId, from_admin: fromAdmin, body: text }).execute()
   }
 
-  logger.info({ taskIds: targetTaskIds, fromAdmin }, 'logged task note from WhatsApp reply')
+  logger.info({ taskIds: targets.map((t) => t.id), fromAdmin }, 'logged task note from WhatsApp reply')
+
+  if (isDoneReply(text)) {
+    const incompleteIds = targets.filter((t) => t.status !== 'completed').map((t) => t.id)
+    if (incompleteIds.length > 0) {
+      const fullTasks = await db.selectFrom('tasks').selectAll().where('id', 'in', incompleteIds).execute()
+      for (const task of fullTasks) {
+        await completeTask(task, { via: 'whatsapp_reply_done' })
+        logger.info({ taskId: task.id, fromAdmin }, 'task marked completed via "done" reply')
+      }
+    }
+  }
+
   return true
 }
 

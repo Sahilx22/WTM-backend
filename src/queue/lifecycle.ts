@@ -5,6 +5,11 @@ import { initTaskReminderQueue, startTaskReminderWorker } from './taskReminders.
 import { initAutoReportQueues, startAutoReportWorkers, applyAutoReportSchedule, listAllTaskSettings } from './autoReports.js'
 import { initDigestQueues, startDigestWorkers, applyDigestSchedule } from './scheduledDigests.js'
 import { initRecurringTaskQueue, startRecurringTaskWorker } from './recurringTasks.js'
+import {
+  initRecurringReminderQueue,
+  startRecurringReminderWorker,
+  scheduleUnscheduledRecurringReminders
+} from './recurringReminders.js'
 import { connectionEvents, isAnySessionConnected } from '../whatsapp/connectionManager.js'
 import { isProduction } from '../config/env.js'
 import type { TaskSettings } from '../db/schema.js'
@@ -49,6 +54,15 @@ async function registerWorkers(): Promise<void> {
   await startDigestWorkers()
   await initRecurringTaskQueue()
   await startRecurringTaskWorker()
+  // Deliberately NOT re-applied per-organization in ensureQueuesRunning()
+  // below the way applyDigestSchedule/applyAutoReportSchedule are — each
+  // reminder's one pending job already lives in pg-boss's own Postgres-
+  // backed queue table (see queue/recurringReminders.ts), so it's simply
+  // picked up whenever a worker next polls; re-scheduling it in bulk on
+  // every reconnect is exactly the pattern that caused migration 042's
+  // duplicate-digest bug, so this queue just avoids it outright.
+  await initRecurringReminderQueue()
+  await startRecurringReminderWorker()
 }
 
 // How long to wait before trying again after a failed start (e.g. the
@@ -71,6 +85,9 @@ export async function ensureQueuesRunning(): Promise<void> {
       await applyAutoReportSchedule(settings.organization_id, settings)
       await applyDigestSchedule(settings.organization_id, settings)
     }
+    // Only reminders with no pending job — never a bulk re-apply (see the
+    // note in registerWorkers()).
+    await scheduleUnscheduledRecurringReminders()
     logger.info('queue workers started — a WhatsApp session is connected')
   } catch (err) {
     logger.error({ err }, 'failed to start queue workers — will retry shortly')

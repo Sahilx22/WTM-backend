@@ -65,7 +65,8 @@ authRouter.post('/auth/login', authRateLimit, async (req, res) => {
     id: user.id,
     username: user.username,
     organizationId: user.organization_id,
-    isSuperAdmin: user.is_super_admin
+    isSuperAdmin: user.is_super_admin,
+    role: user.role
   })
 
   const organization = user.organization_id
@@ -84,6 +85,7 @@ authRouter.post('/auth/login', authRateLimit, async (req, res) => {
       displayName: user.display_name,
       organizationId: user.organization_id,
       isSuperAdmin: user.is_super_admin,
+      role: user.role,
       organization: organization ? { id: organization.id, name: organization.name, logoUrl: organization.logo_url } : null
     }
   })
@@ -97,7 +99,7 @@ authRouter.post('/auth/logout', requireAuth, async (req, res) => {
 authRouter.get('/auth/me', requireAuth, async (req, res) => {
   const user = await db
     .selectFrom('users')
-    .select(['id', 'username', 'display_name', 'organization_id', 'is_super_admin'])
+    .select(['id', 'username', 'display_name', 'organization_id', 'is_super_admin', 'role'])
     .where('id', '=', req.user!.id)
     .executeTakeFirst()
 
@@ -121,6 +123,7 @@ authRouter.get('/auth/me', requireAuth, async (req, res) => {
       displayName: user.display_name,
       organizationId: user.organization_id,
       isSuperAdmin: user.is_super_admin,
+      role: user.role,
       organization: organization ? { id: organization.id, name: organization.name, logoUrl: organization.logo_url } : null
     }
   })

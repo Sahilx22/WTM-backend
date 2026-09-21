@@ -18,6 +18,9 @@ import { settingsRouter } from './modules/settings/routes.js'
 import { organizationsRouter } from './modules/organizations/routes.js'
 import { tasksRouter } from './modules/tasks/routes.js'
 import { reportsRouter } from './modules/reports/routes.js'
+import { sharedAccessRouter } from './modules/sharedAccess/routes.js'
+import { chatRouter } from './modules/chat/routes.js'
+import { recurringRemindersRouter } from './modules/recurringReminders/routes.js'
 import { notFound, errorHandler } from './middleware/errorHandler.js'
 import { writeRateLimit } from './middleware/writeRateLimit.js'
 
@@ -69,6 +72,9 @@ apiRouter.use(settingsRouter)
 apiRouter.use(organizationsRouter)
 apiRouter.use(tasksRouter)
 apiRouter.use(reportsRouter)
+apiRouter.use(sharedAccessRouter)
+apiRouter.use(chatRouter)
+apiRouter.use(recurringRemindersRouter)
 
 app.use('/api', apiRouter)
 

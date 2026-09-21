@@ -27,6 +27,8 @@ import {
 } from './store.js'
 import { handleMessageForTasks } from './taskEngine.js'
 import { handleCommandMessage } from './commandEngine.js'
+import { persistChatMessage } from './chatMessages.js'
+import { handleRecurringReminderMessage } from './recurringReminderEngine.js'
 import type { ConnectionStatus, WhatsappSession } from '../db/schema.js'
 
 const logger = pino({ level: isProduction ? 'error' : 'warn' })
@@ -116,6 +118,30 @@ export function getPrimarySocketForOrganization(organizationId: number): WASocke
     }
   }
   return null
+}
+
+// Every session of one organization that is *actually* connected right now
+// — judged by the live runtime (a real socket, status 'connected'), never
+// by the last status persisted in the database, which can say "connected"
+// for a session this process hasn't (re)connected. Primary first.
+export function getConnectedSessionsForOrganization(organizationId: number): SessionSnapshot[] {
+  const connected: SessionSnapshot[] = []
+  for (const r of runtimes.values()) {
+    if (r.snapshot.organizationId === organizationId && r.snapshot.status === 'connected' && r.sock) {
+      connected.push(r.snapshot)
+    }
+  }
+  return connected.sort((a, b) => Number(b.isPrimary) - Number(a.isPrimary) || a.sessionId - b.sessionId)
+}
+
+// The live socket for one *specific* session, only if that session belongs
+// to `organizationId` and is connected right now — null otherwise. Used
+// where a send must go out through exactly the number the admin picked
+// (campaigns), with no silent fallback to a different session.
+export function getConnectedSocketForSession(sessionId: number, organizationId: number): WASocket | null {
+  const r = runtimes.get(sessionId)
+  if (!r || r.snapshot.organizationId !== organizationId || r.snapshot.status !== 'connected' || !r.sock) return null
+  return r.sock
 }
 
 // The connected primary session's own snapshot for one organization — used
@@ -340,9 +366,19 @@ export async function startConnection(sessionId: number): Promise<void> {
           logger.warn({ err, key: m.key }, 'failed processing message for task engine')
         }
         try {
+          await handleRecurringReminderMessage(sock, m, sessionId, runtime.snapshot.organizationId)
+        } catch (err) {
+          logger.warn({ err, key: m.key }, 'failed processing message for recurring reminder engine')
+        }
+        try {
           await handleCommandMessage(sock, runtime.snapshot.waJid, m, runtime.snapshot.organizationId)
         } catch (err) {
           logger.warn({ err, key: m.key }, 'failed processing message for command engine')
+        }
+        try {
+          await persistChatMessage(sock, m, runtime.snapshot.organizationId)
+        } catch (err) {
+          logger.warn({ err, key: m.key }, 'failed persisting chat message')
         }
       }
     })

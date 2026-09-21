@@ -20,6 +20,18 @@ export async function initDigestQueues(): Promise<void> {
   await boss.createQueue(QUEUE_REVIEW_DIGEST, { retryLimit: 1 })
 }
 
+// Idempotency guard shared by all three digest sends: a WhatsApp reconnect
+// re-applies every organization's schedule (see applyDigestSchedule's
+// callers), which can spawn a second, independent self-perpetuating chain
+// alongside one that's already pending — this makes the actual *send* safe
+// to attempt more than once, by refusing to send the same digest twice on
+// the same calendar day, regardless of how many chains exist upstream.
+function alreadySentToday(lastSentAt: Date | null): boolean {
+  if (!lastSentAt) return false
+  const now = new Date()
+  return lastSentAt.getFullYear() === now.getFullYear() && lastSentAt.getMonth() === now.getMonth() && lastSentAt.getDate() === now.getDate()
+}
+
 function nextDailyAt(hour: number, minute: number, from: Date): Date {
   const next = new Date(from.getFullYear(), from.getMonth(), from.getDate(), hour, minute, 0, 0)
   if (next.getTime() <= from.getTime()) next.setDate(next.getDate() + 1)
@@ -64,9 +76,38 @@ export async function applyDigestSchedule(organizationId: number, settings: Task
   }
 }
 
+// Long lists are capped so one person with a huge backlog can't produce an
+// unreadably long message — the rest are summarized as "…and N more".
+const MAX_PENDING_NAMES_LISTED = 25
+
+// The pending tasks are listed by name (not just counted) so the recipient
+// can see exactly which tasks are still open; completed and in-review stay
+// as plain counts.
+export function buildDailyOverviewText(completed: number, pendingNames: string[], needsReview: number): string {
+  const lines = ['📋 *Your task overview for today*', `✅ Completed: ${completed}`, `🕓 Pending: ${pendingNames.length}`]
+
+  pendingNames.slice(0, MAX_PENDING_NAMES_LISTED).forEach((name, i) => {
+    lines.push(`   ${i + 1}. ${name}`)
+  })
+  if (pendingNames.length > MAX_PENDING_NAMES_LISTED) {
+    lines.push(`   …and ${pendingNames.length - MAX_PENDING_NAMES_LISTED} more`)
+  }
+
+  lines.push(`🔎 In review: ${needsReview}`)
+  return lines.join('\n')
+}
+
 async function sendDailyOverview(organizationId: number): Promise<void> {
   const settings = await db.selectFrom('task_settings').selectAll().where('organization_id', '=', organizationId).executeTakeFirst()
   if (!settings || !settings.daily_overview_enabled) return
+
+  const { hour, minute } = cronFromTime(settings.daily_overview_time)
+
+  if (alreadySentToday(settings.daily_overview_last_sent_at)) {
+    logger.warn({ organizationId }, 'daily overview already sent today — skipping duplicate, just rescheduling tomorrow')
+    await enqueueDigest(QUEUE_DAILY_OVERVIEW, organizationId, nextDailyAt(hour, minute, new Date()))
+    return
+  }
 
   const sock = getPrimarySocketForOrganization(organizationId)
   if (!sock) {
@@ -89,22 +130,23 @@ async function sendDailyOverview(organizationId: number): Promise<void> {
     try {
       const rows = await db
         .selectFrom('tasks')
-        .select(['status'])
+        .select(['name', 'status'])
         .where('recipient_jid', '=', recipient_jid)
         .where('organization_id', '=', organizationId)
+        .orderBy('created_at', 'asc')
         .execute()
       const completed = rows.filter((r) => r.status === 'completed').length
-      const pending = rows.filter((r) => r.status === 'pending').length
+      const pendingNames = rows.filter((r) => r.status === 'pending').map((r) => r.name)
       const needsReview = rows.filter((r) => r.status === 'needs_review').length
 
-      const text = `📋 *Your task overview for today*\n✅ Completed: ${completed}\n🕓 Pending: ${pending}\n🔎 In review: ${needsReview}`
-      await sock.sendMessage(recipient_jid, { text })
+      await sock.sendMessage(recipient_jid, { text: buildDailyOverviewText(completed, pendingNames, needsReview) })
     } catch (err) {
       logger.warn({ err, organizationId, recipient_jid }, 'failed to send daily overview')
     }
   }
 
-  const { hour, minute } = cronFromTime(settings.daily_overview_time)
+  await db.updateTable('task_settings').set({ daily_overview_last_sent_at: new Date() }).where('organization_id', '=', organizationId).execute()
+
   await enqueueDigest(QUEUE_DAILY_OVERVIEW, organizationId, nextDailyAt(hour, minute, new Date()))
 }
 
@@ -117,6 +159,15 @@ function startOfWeek(date: Date): Date {
 async function sendWeeklyReport(organizationId: number): Promise<void> {
   const settings = await db.selectFrom('task_settings').selectAll().where('organization_id', '=', organizationId).executeTakeFirst()
   if (!settings || !settings.weekly_report_enabled) return
+
+  const dayNum = WEEKDAY_NUMBERS[settings.weekly_report_day] ?? 1
+  const { hour, minute } = cronFromTime(settings.weekly_report_time)
+
+  if (alreadySentToday(settings.weekly_report_last_sent_at)) {
+    logger.warn({ organizationId }, 'weekly report already sent today — skipping duplicate, just rescheduling next week')
+    await enqueueDigest(QUEUE_WEEKLY_REPORT, organizationId, nextWeeklyAt(dayNum, hour, minute, new Date()))
+    return
+  }
 
   const sock = getPrimarySocketForOrganization(organizationId)
   if (!sock) {
@@ -158,14 +209,22 @@ async function sendWeeklyReport(organizationId: number): Promise<void> {
     }
   }
 
-  const { hour, minute } = cronFromTime(settings.weekly_report_time)
-  const dayNum = WEEKDAY_NUMBERS[settings.weekly_report_day] ?? 1
+  await db.updateTable('task_settings').set({ weekly_report_last_sent_at: new Date() }).where('organization_id', '=', organizationId).execute()
+
   await enqueueDigest(QUEUE_WEEKLY_REPORT, organizationId, nextWeeklyAt(dayNum, hour, minute, new Date()))
 }
 
 async function sendReviewDigest(organizationId: number): Promise<void> {
   const settings = await db.selectFrom('task_settings').selectAll().where('organization_id', '=', organizationId).executeTakeFirst()
   if (!settings || !settings.review_digest_enabled) return
+
+  const { hour, minute } = cronFromTime(settings.review_digest_time)
+
+  if (alreadySentToday(settings.review_digest_last_sent_at)) {
+    logger.warn({ organizationId }, 'review digest already sent today — skipping duplicate, just rescheduling tomorrow')
+    await enqueueDigest(QUEUE_REVIEW_DIGEST, organizationId, nextDailyAt(hour, minute, new Date()))
+    return
+  }
 
   const sock = getPrimarySocketForOrganization(organizationId)
   const snapshot = getPrimarySnapshotForOrganization(organizationId)
@@ -202,7 +261,8 @@ async function sendReviewDigest(organizationId: number): Promise<void> {
     }
   }
 
-  const { hour, minute } = cronFromTime(settings.review_digest_time)
+  await db.updateTable('task_settings').set({ review_digest_last_sent_at: new Date() }).where('organization_id', '=', organizationId).execute()
+
   await enqueueDigest(QUEUE_REVIEW_DIGEST, organizationId, nextDailyAt(hour, minute, new Date()))
 }
 

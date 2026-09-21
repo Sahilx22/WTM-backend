@@ -63,3 +63,20 @@ export function isThumbsUp(emoji: string | null | undefined): boolean {
   if (!emoji) return false
   return THUMBS_UP_VARIANTS.has(emoji.trim())
 }
+
+const DONE_REPLY_TEXTS = new Set(['done', 'task done', 'marked done', 'completed', 'task completed', 'mark done', 'mark as done'])
+
+// Trailing punctuation/emoji a "done" reply commonly carries ("Done!",
+// "done.", "done ✅") — stripped before the exact-match check below.
+const DONE_TRAILING_CHARS = /[.,!?\s✅✔️🎉👍]+$/u
+
+// A quote-reply (or a Chat-page message — see modules/chat/routes.ts) whose
+// text, once trimmed of trailing punctuation, IS one of a small set of
+// common "I'm done" phrasings — deliberately an exact match rather than a
+// substring/prefix match, so a message like "done with the first draft,
+// still need to finish the rest" is never mistaken for a completion signal.
+export function isDoneReply(text: string | null | undefined): boolean {
+  if (!text) return false
+  const cleaned = text.trim().replace(DONE_TRAILING_CHARS, '').trim().toLowerCase()
+  return DONE_REPLY_TEXTS.has(cleaned)
+}

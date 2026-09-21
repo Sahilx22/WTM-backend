@@ -23,6 +23,8 @@ export type ConnectionStatus = 'disconnected' | 'connecting' | 'qr_pending' | 'c
 export type ContactSource = 'manual' | 'csv' | 'whatsapp'
 export type AttemptStatus = 'success' | 'failure'
 export type CsvRowValidity = 'valid' | 'duplicate' | 'invalid'
+export type UserRole = 'admin' | 'restricted'
+export type ChatMessageDirection = 'inbound' | 'outbound'
 
 export interface OrganizationsTable {
   id: Generated<number>
@@ -66,6 +68,10 @@ export interface UsersTable {
   // Null for the super-admin account only — every regular org user has this set.
   organization_id: number | null
   is_super_admin: Generated<boolean>
+  // 'restricted' users only get whatever contact_access_grants gives them
+  // access to (see the Chat feature) — everyone else created before this
+  // was added, and every org's original admin login, defaults to 'admin'.
+  role: Generated<UserRole>
 }
 
 export interface SessionTable {
@@ -174,6 +180,9 @@ export interface CampaignsTable {
   // Which organization owns this campaign — null only for campaigns created
   // before this was added.
   organization_id: number | null
+  // Which linked WhatsApp session sends this campaign — null means the
+  // organization's primary session (campaigns created before this existed).
+  whatsapp_session_id: number | null
 }
 
 export interface MessagesTable {
@@ -186,6 +195,7 @@ export interface MessagesTable {
   message_type: MessageType
   message_text: string | null
   media_path: string | null
+  media_mimetype: string | null
   template_id: number | null
   status: Generated<MessageStatus>
   wa_message_id: string | null
@@ -203,6 +213,31 @@ export interface MessagesTable {
   // rate-limit query filters by it. Null only for messages created before
   // this was added.
   organization_id: number | null
+  // Where this send originated — 'chat' for the per-contact Chat composer,
+  // 'bulk' (the default) for everything else (Send/Schedule/Campaigns).
+  source: Generated<string>
+}
+
+export interface ContactAccessGrantsTable {
+  id: Generated<number>
+  organization_id: number
+  user_id: number
+  contact_id: number
+  granted_by: number | null
+  created_at: Generated<Date>
+}
+
+export interface ChatMessagesTable {
+  id: Generated<number>
+  organization_id: number
+  contact_id: number
+  direction: ChatMessageDirection
+  message_type: MessageType
+  message_text: string | null
+  media_path: string | null
+  media_mimetype: string | null
+  wa_message_id: string | null
+  created_at: Generated<Date>
 }
 
 export interface MessageAttemptsTable {
@@ -349,13 +384,40 @@ export interface TaskSettingsTable {
   reminder_daily_time: Generated<string>
   daily_overview_enabled: Generated<boolean>
   daily_overview_time: Generated<string>
+  // When each digest last actually went out — the send-time idempotency
+  // guard in queue/scheduledDigests.ts (compares this to "today" before
+  // sending) so a re-applied schedule (e.g. after a WhatsApp reconnect)
+  // can never result in the same digest going out twice in one day.
+  daily_overview_last_sent_at: Date | null
   weekly_report_enabled: Generated<boolean>
   weekly_report_day: Generated<WeekDay>
   weekly_report_time: Generated<string>
+  weekly_report_last_sent_at: Date | null
   review_digest_enabled: Generated<boolean>
   review_digest_time: Generated<string>
+  review_digest_last_sent_at: Date | null
   updated_at: Generated<Date>
   updated_by: number | null
+}
+
+export interface RecurringRemindersTable {
+  id: Generated<number>
+  organization_id: number | null
+  recipient_jid: string
+  contact_id: number | null
+  message_text: string
+  // "HH:MM" — fixed at creation time, never separately configurable.
+  scheduled_time: string
+  // Null means "repeat forever until turned off".
+  end_date: Date | null
+  enabled: Generated<boolean>
+  last_sent_at: Date | null
+  next_send_job_id: string | null
+  next_send_at: Date | null
+  wa_message_id: string | null
+  created_by_session_id: number | null
+  created_at: Generated<Date>
+  updated_at: Generated<Date>
 }
 
 export interface Database {
@@ -380,6 +442,9 @@ export interface Database {
   task_messages: TaskMessagesTable
   task_notes: TaskNotesTable
   task_settings: TaskSettingsTable
+  contact_access_grants: ContactAccessGrantsTable
+  chat_messages: ChatMessagesTable
+  recurring_reminders: RecurringRemindersTable
 }
 
 export type Organization = Selectable<OrganizationsTable>
@@ -443,3 +508,13 @@ export type NewTaskNote = Insertable<TaskNotesTable>
 
 export type TaskSettings = Selectable<TaskSettingsTable>
 export type TaskSettingsUpdate = Updateable<TaskSettingsTable>
+
+export type ContactAccessGrant = Selectable<ContactAccessGrantsTable>
+export type NewContactAccessGrant = Insertable<ContactAccessGrantsTable>
+
+export type ChatMessage = Selectable<ChatMessagesTable>
+export type NewChatMessage = Insertable<ChatMessagesTable>
+
+export type RecurringReminder = Selectable<RecurringRemindersTable>
+export type NewRecurringReminder = Insertable<RecurringRemindersTable>
+export type RecurringReminderUpdate = Updateable<RecurringRemindersTable>

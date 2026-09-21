@@ -43,3 +43,15 @@ export function requireSuperAdmin(req: Request, res: Response, next: NextFunctio
 
   next()
 }
+
+// Gates the Shared Access module (managing restricted employees and their
+// contact grants) — a restricted user must never reach it, regardless of
+// which organization they belong to.
+export function requireOrgAdmin(req: Request, res: Response, next: NextFunction): void {
+  if (!req.user?.organizationId || req.user.role === 'restricted') {
+    res.status(403).json({ error: 'Admin access required.' })
+    return
+  }
+
+  next()
+}

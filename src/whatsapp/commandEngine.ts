@@ -8,8 +8,9 @@ import { renderTaskReportPdf } from '../reports/taskReportPdf.js'
 import { loadReportBranding } from '../reports/branding.js'
 import { recipientDisplayName } from '../lib/recipientDisplay.js'
 import { recordAuditLog } from '../lib/auditLog.js'
+import { completeTask } from '../lib/taskCompletion.js'
 import { scheduleNextReminder, cancelTaskReminder } from '../queue/taskReminders.js'
-import { scheduleRecurrence, cancelRecurrence } from '../queue/recurringTasks.js'
+import { cancelRecurrence } from '../queue/recurringTasks.js'
 import { formatShortDate } from '../lib/dateFormat.js'
 import { resolveContactId } from './taskEngine.js'
 import type { TaskStatus, TaskPriority, RecurrenceUnit } from '../db/schema.js'
@@ -194,26 +195,7 @@ async function handleCompleteCommand(sock: WASocket, ownJid: string, organizatio
     return
   }
 
-  await cancelTaskReminder(task.next_reminder_job_id)
-
-  const completedAt = new Date()
-  await db
-    .updateTable('tasks')
-    .set({ status: 'completed', completed_at: completedAt, next_reminder_job_id: null, updated_at: completedAt })
-    .where('id', '=', taskId)
-    .execute()
-
-  await recordAuditLog({
-    userId: null,
-    action: 'task_completed',
-    entityType: 'task',
-    entityId: taskId,
-    metadata: { via: 'whatsapp_command' }
-  })
-
-  if (task.is_recurring) {
-    await scheduleRecurrence({ ...task, status: 'completed', completed_at: completedAt })
-  }
+  await completeTask(task, { via: 'whatsapp_command' })
 
   await sock.sendMessage(ownJid, { text: `✅ Marked *${task.name}* (#${taskId}) as completed.` })
 }

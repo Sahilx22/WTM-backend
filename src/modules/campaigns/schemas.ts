@@ -23,6 +23,12 @@ export const campaignInputSchema = z.object({
     .string()
     .optional()
     .transform((v) => (v ? v : null)),
+  // Which linked WhatsApp sends the campaign — only needed when more than
+  // one is connected (the route defaults to the primary/only one).
+  whatsapp_session_id: z
+    .string()
+    .optional()
+    .transform((v) => (v ? Number(v) : null)),
   min_delay_ms: z
     .string()
     .optional()

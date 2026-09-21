@@ -1,15 +1,15 @@
 import { Router } from 'express'
 import { db } from '../../db/index.js'
 import { recordAuditLog } from '../../lib/auditLog.js'
+import { completeTask } from '../../lib/taskCompletion.js'
 import { cancelTaskReminder, scheduleNextReminder } from '../../queue/taskReminders.js'
-import { scheduleRecurrence } from '../../queue/recurringTasks.js'
 import { recipientDisplayName } from '../../lib/recipientDisplay.js'
 import { resolveContactId } from '../../whatsapp/taskEngine.js'
 import { getPrimarySocketForOrganization } from '../../whatsapp/connectionManager.js'
 
 export const tasksRouter = Router()
 
-async function loadTasks(status: string, reminder: string, category: string, organizationId?: number) {
+async function loadTasks(status: string, reminder: string, category: string, recipient: string, organizationId?: number) {
   let query = db
     .selectFrom('tasks')
     .leftJoin('contacts', 'contacts.id', 'tasks.contact_id')
@@ -52,6 +52,10 @@ async function loadTasks(status: string, reminder: string, category: string, org
     query = query.where('tasks.category', '=', category)
   }
 
+  if (recipient) {
+    query = query.where('tasks.recipient_jid', '=', recipient)
+  }
+
   if (reminder === 'on' || reminder === 'off') {
     query = query
       .where('tasks.status', '=', 'pending')
@@ -75,8 +79,36 @@ tasksRouter.get('/tasks', async (req, res) => {
   const status = typeof req.query.status === 'string' ? req.query.status : ''
   const reminder = typeof req.query.reminder === 'string' ? req.query.reminder : ''
   const category = typeof req.query.category === 'string' ? req.query.category : ''
-  const tasks = await loadTasks(status, reminder, category, req.user?.organizationId ?? undefined)
+  const recipient = typeof req.query.recipient === 'string' ? req.query.recipient : ''
+  const tasks = await loadTasks(status, reminder, category, recipient, req.user?.organizationId ?? undefined)
   res.json({ tasks })
+})
+
+// The distinct set of employees/recipients that currently have at least one
+// task, for the Tasks page's "filter by employee" dropdown — deliberately
+// its own endpoint rather than derived from the (possibly already-filtered)
+// /tasks list, so the dropdown's option list stays stable regardless of
+// which other filters (status/category/reminders) are currently active.
+tasksRouter.get('/tasks/recipients', async (req, res) => {
+  const organizationId = req.user?.organizationId ?? undefined
+
+  let query = db
+    .selectFrom('tasks')
+    .leftJoin('contacts', 'contacts.id', 'tasks.contact_id')
+    .leftJoin('groups', 'groups.wa_jid', 'tasks.recipient_jid')
+    .select(['tasks.recipient_jid', 'contacts.display_name as contactName', 'groups.subject as groupSubject'])
+    .distinct()
+
+  if (organizationId !== undefined) {
+    query = query.where('tasks.organization_id', '=', organizationId)
+  }
+
+  const rows = await query.execute()
+  const recipients = rows
+    .map((r) => ({ jid: r.recipient_jid, name: recipientDisplayName(r.recipient_jid, r.contactName, r.groupSubject) }))
+    .sort((a, b) => a.name.localeCompare(b.name))
+
+  res.json({ recipients })
 })
 
 // Chat notes logged whenever someone quote-replies to this task's original
@@ -218,31 +250,7 @@ tasksRouter.post('/tasks/:id/complete', async (req, res) => {
   const task = await taskQuery.executeTakeFirst()
 
   if (task) {
-    await cancelTaskReminder(task.next_reminder_job_id)
-    const completedAt = new Date()
-    await db
-      .updateTable('tasks')
-      .set({
-        status: 'completed',
-        next_reminder_job_id: null,
-        next_reminder_at: null,
-        completed_at: completedAt,
-        updated_at: completedAt
-      })
-      .where('id', '=', id)
-      .execute()
-
-    await recordAuditLog({
-      userId: req.user?.id ?? null,
-      action: 'task_completed',
-      entityType: 'task',
-      entityId: id,
-      ipAddress: req.ip
-    })
-
-    if (task.is_recurring) {
-      await scheduleRecurrence({ ...task, status: 'completed', completed_at: completedAt })
-    }
+    await completeTask(task, { userId: req.user?.id ?? null, ipAddress: req.ip })
   }
 
   res.status(204).end()
