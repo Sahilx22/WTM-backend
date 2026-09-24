@@ -141,13 +141,38 @@ async function processRecurringReminder(reminderId: number): Promise<void> {
     return
   }
 
+  let waMessageId: string | null = null
+  let sendError: string | null = null
   try {
-    await sock.sendMessage(reminder.recipient_jid, { text: `🔁 ${reminder.message_text}` })
+    const result = await sock.sendMessage(reminder.recipient_jid, { text: `🔁 ${reminder.message_text}` })
+    waMessageId = result?.key?.id ?? null
   } catch (err) {
+    sendError = err instanceof Error ? err.message : 'Unknown send error'
     logger.warn({ err, reminderId }, 'failed to send recurring reminder')
   }
 
-  await db.updateTable('recurring_reminders').set({ last_sent_at: new Date(), updated_at: new Date() }).where('id', '=', reminderId).execute()
+  // Every attempt is logged — the portal's sent/failed counts and history
+  // come from this table. Only a successful send counts as "sent today"
+  // (last_sent_at); a failed one is recorded and simply tried again with
+  // tomorrow's occurrence.
+  await db
+    .insertInto('recurring_reminder_sends')
+    .values({
+      reminder_id: reminderId,
+      organization_id: reminder.organization_id,
+      status: sendError ? 'failed' : 'sent',
+      error_message: sendError,
+      wa_message_id: waMessageId
+    })
+    .execute()
+
+  if (!sendError) {
+    await db
+      .updateTable('recurring_reminders')
+      .set({ last_sent_at: new Date(), wa_message_id: waMessageId, updated_at: new Date() })
+      .where('id', '=', reminderId)
+      .execute()
+  }
 
   await scheduleNextRecurringReminder(reminderId)
 }

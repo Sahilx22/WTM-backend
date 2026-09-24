@@ -420,6 +420,16 @@ export interface RecurringRemindersTable {
   updated_at: Generated<Date>
 }
 
+export interface RecurringReminderSendsTable {
+  id: Generated<number>
+  reminder_id: number
+  organization_id: number | null
+  status: 'sent' | 'failed'
+  error_message: string | null
+  wa_message_id: string | null
+  sent_at: Generated<Date>
+}
+
 export interface Database {
   organizations: OrganizationsTable
   users: UsersTable
@@ -445,6 +455,7 @@ export interface Database {
   contact_access_grants: ContactAccessGrantsTable
   chat_messages: ChatMessagesTable
   recurring_reminders: RecurringRemindersTable
+  recurring_reminder_sends: RecurringReminderSendsTable
 }
 
 export type Organization = Selectable<OrganizationsTable>

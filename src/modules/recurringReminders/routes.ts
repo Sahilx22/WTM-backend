@@ -36,13 +36,62 @@ recurringRemindersRouter.get('/recurring-reminders', async (req, res) => {
   }
 
   const rows = await query.execute()
-  const reminders = rows.map((r) => ({
-    ...r,
-    recipientName: recipientDisplayName(r.recipient_jid, r.contactName, r.groupSubject),
-    createdByLabel: r.createdBySessionLabel ?? r.createdBySessionPhone ?? null
-  }))
+
+  // Sent/failed attempt counts per reminder, from the send log.
+  const counts = new Map<number, { sent: number; failed: number }>()
+  if (rows.length > 0) {
+    const grouped = await db
+      .selectFrom('recurring_reminder_sends')
+      .select(['reminder_id', 'status'])
+      .select((eb) => eb.fn.countAll<string>().as('count'))
+      .where('reminder_id', 'in', rows.map((r) => r.id))
+      .groupBy(['reminder_id', 'status'])
+      .execute()
+    for (const g of grouped) {
+      const entry = counts.get(g.reminder_id) ?? { sent: 0, failed: 0 }
+      entry[g.status] = Number(g.count)
+      counts.set(g.reminder_id, entry)
+    }
+  }
+
+  const today = new Date()
+  today.setHours(0, 0, 0, 0)
+  const reminders = rows.map((r) => {
+    const ended = r.end_date !== null && new Date(new Date(r.end_date).setHours(0, 0, 0, 0)).getTime() < today.getTime()
+    return {
+      ...r,
+      recipientName: recipientDisplayName(r.recipient_jid, r.contactName, r.groupSubject),
+      createdByLabel: r.createdBySessionLabel ?? r.createdBySessionPhone ?? null,
+      sentCount: counts.get(r.id)?.sent ?? 0,
+      failedCount: counts.get(r.id)?.failed ?? 0,
+      // 'completed' = ran through its "till" date; 'off' = turned off by hand.
+      status: ended ? 'completed' : r.enabled ? 'active' : 'off'
+    }
+  })
 
   res.json({ reminders })
+})
+
+// The send log for one reminder, newest first — what the portal shows in a
+// reminder's history view.
+recurringRemindersRouter.get('/recurring-reminders/:id/history', async (req, res) => {
+  const id = Number(req.params.id)
+  let owned = db.selectFrom('recurring_reminders').select('id').where('id', '=', id)
+  if (req.user?.organizationId) owned = owned.where('organization_id', '=', req.user.organizationId)
+  if (!(await owned.executeTakeFirst())) {
+    res.status(404).json({ error: 'Recurring reminder not found.' })
+    return
+  }
+
+  const sends = await db
+    .selectFrom('recurring_reminder_sends')
+    .select(['id', 'status', 'error_message', 'sent_at'])
+    .where('reminder_id', '=', id)
+    .orderBy('sent_at', 'desc')
+    .limit(100)
+    .execute()
+
+  res.json({ sends })
 })
 
 recurringRemindersRouter.post('/recurring-reminders/:id/toggle', async (req, res) => {

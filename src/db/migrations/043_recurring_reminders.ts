@@ -1,7 +1,7 @@
 import { Kysely, sql } from 'kysely'
 
 // A standalone recurring-message feature, deliberately separate from tasks:
-// typing "<message> #schedule" (optionally "#schedule till dd-mm-yy") in any
+// typing "<message> #sced" (optionally "#sced till dd-mm-yy") in any
 // WhatsApp chat schedules that exact message to repeat daily, at whatever
 // time of day it was created, to that same chat — forever if no "till" date
 // is given, or through that date if one is. `enabled` lets the portal turn
@@ -15,7 +15,7 @@ export async function up(db: Kysely<any>): Promise<void> {
     .addColumn('contact_id', 'integer', (col) => col.references('contacts.id').onDelete('set null'))
     .addColumn('message_text', 'text', (col) => col.notNull())
     // "HH:MM", the wall-clock time this reminder fires daily — fixed at
-    // creation time (whenever the #schedule message was sent), never
+    // creation time (whenever the #sced message was sent), never
     // separately configurable, per the feature's own "no other time option".
     .addColumn('scheduled_time', 'varchar(5)', (col) => col.notNull())
     // Null means "repeat forever until turned off" — the "till dd-mm-yy"

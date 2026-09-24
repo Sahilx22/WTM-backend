@@ -5,19 +5,19 @@ export interface ParsedRecurringReminder {
   endDate: Date | null
 }
 
-// "#schedule" (optionally "#schedule till dd-mm-yy") anchored to the very
-// end of the message — e.g. "Check inventory levels #schedule till 19-09-26"
-// or "Good morning team, don't forget standup #schedule" (no end date =
+// "#sced" (optionally "#sced till dd-mm-yy") anchored to the very
+// end of the message — e.g. "Check inventory levels #sced till 19-09-26"
+// or "Good morning team, don't forget standup #sced" (no end date =
 // repeats forever until turned off from the portal).
-const SCHEDULE_RE = new RegExp(`#schedule(?:\\s+till\\s+(${SHORT_DATE_RE.source}))?\\s*$`, 'i')
+const SCHEDULE_RE = new RegExp(`#sced(?:\\s+till\\s+(${SHORT_DATE_RE.source}))?\\s*$`, 'i')
 
 // A message that also starts with "#task" is a task, not a recurring
-// reminder, even if it happens to end with "#schedule" too — the two
+// reminder, even if it happens to end with "#sced" too — the two
 // commands are deliberately mutually exclusive so a single message never
 // creates both.
 const TASK_TAG_RE = /^#task\b/i
 
-// Parses a phone-typed message ending in "#schedule" into the reminder text
+// Parses a phone-typed message ending in "#sced" into the reminder text
 // (everything before the tag) plus an optional end date. Returns null if the
 // message doesn't end with the tag, is a #task message, or has no text
 // before the tag to actually send.

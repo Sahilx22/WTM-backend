@@ -54,7 +54,7 @@ export async function handleRecurringReminderMessage(
     metadata: { recipientJid: m.key.remoteJid, endDate: parsed.endDate, sessionId }
   })
 
-  const untilText = parsed.endDate ? ` until ${formatShortDate(parsed.endDate)}` : ' (no end date — reply #schedule again or turn it off from the portal to stop)'
+  const untilText = parsed.endDate ? ` until ${formatShortDate(parsed.endDate)}` : ' (no end date — turn it off from the portal to stop)'
   await sock.sendMessage(m.key.remoteJid, {
     text: `🔁 Recurring reminder set. I'll send "${parsed.text}" every day at ${scheduledTime}${untilText}.`
   })
