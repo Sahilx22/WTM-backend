@@ -22,3 +22,13 @@ export function formatShortDate(date: Date): string {
   const year = String(date.getFullYear()).slice(-2)
   return `${day}-${month}-${year}`
 }
+
+// YYYY-MM-DD using the process's own local date getters — the shape an
+// <input type="date"> round-trips — never date.toISOString().slice(0, 10),
+// which reads UTC fields and silently shifts the date back a day for any
+// local time before 5:30am IST.
+export function formatIsoDate(date: Date): string {
+  const day = String(date.getDate()).padStart(2, '0')
+  const month = String(date.getMonth() + 1).padStart(2, '0')
+  return `${date.getFullYear()}-${month}-${day}`
+}
