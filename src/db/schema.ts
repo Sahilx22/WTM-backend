@@ -216,6 +216,11 @@ export interface MessagesTable {
   // Where this send originated — 'chat' for the per-contact Chat composer,
   // 'bulk' (the default) for everything else (Send/Schedule/Campaigns).
   source: Generated<string>
+  // Which linked WhatsApp session sends this message — null means the
+  // organization's primary session (every message created before this
+  // existed, and campaign messages, which resolve their session through
+  // their own campaign row instead).
+  whatsapp_session_id: number | null
 }
 
 export interface ContactAccessGrantsTable {
@@ -416,6 +421,11 @@ export interface RecurringRemindersTable {
   next_send_at: Date | null
   wa_message_id: string | null
   created_by_session_id: number | null
+  // Which linked WhatsApp sends this reminder daily — null means the
+  // organization's primary session. Set from created_by_session_id for a
+  // reminder created by typing "#sced" (send back through the same number
+  // it was typed into), or chosen explicitly when created from the portal.
+  whatsapp_session_id: number | null
   created_at: Generated<Date>
   updated_at: Generated<Date>
 }

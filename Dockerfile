@@ -25,6 +25,18 @@ FROM node:22-alpine AS production
 WORKDIR /app
 ENV NODE_ENV=production
 
+# The app's date/time logic (task reminders, digests, recurring reminders,
+# the Send/Schedule/Campaigns "date + time" pickers) is written throughout
+# to just use the process's local time (new Date(y,m,d,h,mi), .getHours(),
+# etc.) — it was built and tested on a Windows dev machine already set to
+# IST, so it silently assumed the *server* would be IST too. Alpine has no
+# timezone database by default and defaults to UTC, so without this, every
+# one of those "local time" calls is actually running 5:30 off from what an
+# India-based user typed or expects (e.g. scheduling "now" lands 5:30 later).
+# tzdata provides the zoneinfo files musl/Node need to honor TZ at all.
+RUN apk add --no-cache tzdata
+ENV TZ=Asia/Kolkata
+
 COPY package.json ./
 COPY --from=prod-deps /app/node_modules ./node_modules
 COPY --from=build /app/dist ./dist

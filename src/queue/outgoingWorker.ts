@@ -163,16 +163,25 @@ async function processMessage(messageId: number): Promise<void> {
 
   await db.updateTable('messages').set({ status: 'sending', updated_at: new Date() }).where('id', '=', messageId).execute()
 
+  // A standalone (non-campaign) message can independently be pinned to a
+  // specific WhatsApp too (Send/Schedule) — resolved straight from its own
+  // row rather than a campaign lookup. Unlike campaigns, one message
+  // choosing an unavailable number just fails/retries itself (existing
+  // per-message backoff below) instead of failing a whole batch.
+  const standaloneSessionId = message.campaign_id === null ? message.whatsapp_session_id : null
+
   const sock =
     campaignSessionId !== null
       ? getConnectedSocketForSession(campaignSessionId, organizationId)
-      : getPrimarySocketForOrganization(organizationId)
+      : standaloneSessionId !== null
+        ? getConnectedSocketForSession(standaloneSessionId, organizationId)
+        : getPrimarySocketForOrganization(organizationId)
 
   let error: string | null = null
   let waMessageId: string | null = null
 
   if (!sock) {
-    error = 'WhatsApp is not connected.'
+    error = standaloneSessionId !== null ? 'The selected WhatsApp is not connected.' : 'WhatsApp is not connected.'
   } else {
     try {
       const content = await buildMessageContent(message)

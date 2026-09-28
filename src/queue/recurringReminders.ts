@@ -3,7 +3,7 @@ import { sql } from 'kysely'
 import pino from 'pino'
 import { boss, isBossStarted } from './boss.js'
 import { db } from '../db/index.js'
-import { getPrimarySocketForOrganization } from '../whatsapp/connectionManager.js'
+import { getPrimarySocketForOrganization, getConnectedSocketForSession } from '../whatsapp/connectionManager.js'
 import { nextDailyAnchorTime } from './taskReminders.js'
 import { isProduction } from '../config/env.js'
 
@@ -132,7 +132,12 @@ async function processRecurringReminder(reminderId: number): Promise<void> {
     return
   }
 
-  const sock = reminder.organization_id !== null ? getPrimarySocketForOrganization(reminder.organization_id) : null
+  const sock =
+    reminder.organization_id === null
+      ? null
+      : reminder.whatsapp_session_id !== null
+        ? getConnectedSocketForSession(reminder.whatsapp_session_id, reminder.organization_id)
+        : getPrimarySocketForOrganization(reminder.organization_id)
   if (!sock) {
     // Not connected right now — don't drop it, just push back a few minutes.
     const retryAt = new Date(Date.now() + 5 * 60_000)

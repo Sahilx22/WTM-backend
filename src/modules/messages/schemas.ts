@@ -33,9 +33,31 @@ export const sendMessageSchema = z.object({
 
 export type SendMessageInput = z.infer<typeof sendMessageSchema>
 
-export const scheduleMessageSchema = sendMessageSchema.extend({
-  scheduled_date: z.string().min(1, 'Pick a date'),
-  scheduled_time: z.string().min(1, 'Pick a time')
-})
+export const scheduleMessageSchema = sendMessageSchema
+  .extend({
+    // Required for a one-off schedule; a recurring one only needs
+    // scheduled_time (see the .refine below) — the date field is disabled
+    // in that case, so it may arrive blank.
+    scheduled_date: z.string().optional().default(''),
+    scheduled_time: z.string().min(1, 'Pick a time'),
+    // Which linked WhatsApp sends this — omitted/blank means "use the
+    // primary" (or the only one connected).
+    whatsapp_session_id: z
+      .string()
+      .optional()
+      .transform((v) => (v ? Number(v) : null)),
+    // Recurring: send daily at scheduled_time's time-of-day instead of
+    // once. recurring_end_date is optional — blank means "repeat until
+    // turned off".
+    is_recurring: z
+      .string()
+      .optional()
+      .transform((v) => v === 'true' || v === '1'),
+    recurring_end_date: z
+      .string()
+      .optional()
+      .transform((v) => (v ? v : null))
+  })
+  .refine((data) => data.is_recurring || data.scheduled_date.length > 0, { message: 'Pick a date', path: ['scheduled_date'] })
 
 export type ScheduleMessageInput = z.infer<typeof scheduleMessageSchema>

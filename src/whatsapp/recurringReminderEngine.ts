@@ -4,7 +4,6 @@ import { parseRecurringReminder } from './recurringReminderParser.js'
 import { resolveContactId } from './taskEngine.js'
 import { scheduleNextRecurringReminder } from '../queue/recurringReminders.js'
 import { recordAuditLog } from '../lib/auditLog.js'
-import { formatShortDate } from '../lib/dateFormat.js'
 
 // Only messages sent from the linked phone/app (fromMe) can create a
 // recurring reminder — same deliberate design as #task: typed directly into
@@ -39,7 +38,10 @@ export async function handleRecurringReminderMessage(
       scheduled_time: scheduledTime,
       end_date: parsed.endDate,
       wa_message_id: m.key.id ?? null,
-      created_by_session_id: sessionId
+      created_by_session_id: sessionId,
+      // Reply back through the same number it was typed into daily, not
+      // always the organization's primary session.
+      whatsapp_session_id: sessionId
     })
     .returning('id')
     .executeTakeFirstOrThrow()
@@ -54,8 +56,8 @@ export async function handleRecurringReminderMessage(
     metadata: { recipientJid: m.key.remoteJid, endDate: parsed.endDate, sessionId }
   })
 
-  const untilText = parsed.endDate ? ` until ${formatShortDate(parsed.endDate)}` : ' (no end date — turn it off from the portal to stop)'
-  await sock.sendMessage(m.key.remoteJid, {
-    text: `🔁 Recurring reminder set. I'll send "${parsed.text}" every day at ${scheduledTime}${untilText}.`
-  })
+  // Deliberately silent — no WhatsApp reply. The reminder still shows up on
+  // the portal's Recurring Reminders page immediately; a chat confirmation
+  // isn't wanted (e.g. #sced typed into someone else's chat shouldn't show
+  // them that a reminder was just scheduled around them).
 }

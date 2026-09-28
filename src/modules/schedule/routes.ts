@@ -3,9 +3,15 @@ import { db } from '../../db/index.js'
 import { scheduleMessageSchema } from '../messages/schemas.js'
 import { mediaUpload, getMediaSignedUrl } from '../../lib/mediaUpload.js'
 import { recordAuditLog } from '../../lib/auditLog.js'
-import { getPrimarySocketForOrganization } from '../../whatsapp/connectionManager.js'
+import {
+  getConnectedSessionsForOrganization,
+  getConnectedSocketForSession,
+  maskPhoneNumber
+} from '../../whatsapp/connectionManager.js'
 import { enqueueSendJob, cancelSendJob } from '../../queue/boss.js'
 import { resolveRecipients, resolveMedia } from '../messages/shared.js'
+import { scheduleNextRecurringReminder } from '../../queue/recurringReminders.js'
+import { recipientDisplayName } from '../../lib/recipientDisplay.js'
 
 export const scheduleRouter = Router()
 
@@ -15,16 +21,33 @@ async function loadFormData(templateId: number | null | undefined, organizationI
   let contactsQuery = db.selectFrom('contacts').selectAll().orderBy('display_name', 'asc').orderBy('phone_number', 'asc').limit(500)
   let groupsQuery = db.selectFrom('groups').selectAll().orderBy('subject', 'asc')
   let templatesQuery = db.selectFrom('message_templates').selectAll().orderBy('name', 'asc')
-  let scheduledQuery = db.selectFrom('messages').selectAll().where('status', '=', 'scheduled').orderBy('scheduled_at', 'asc')
+  let scheduledQuery = db
+    .selectFrom('messages')
+    .leftJoin('contacts', 'contacts.id', 'messages.recipient_contact_id')
+    .leftJoin('groups', 'groups.wa_jid', 'messages.recipient_jid')
+    .leftJoin('whatsapp_sessions', 'whatsapp_sessions.id', 'messages.whatsapp_session_id')
+    .select([
+      'messages.id',
+      'messages.recipient_jid',
+      'messages.message_type',
+      'messages.message_text',
+      'messages.scheduled_at',
+      'contacts.display_name as contactName',
+      'groups.subject as groupSubject',
+      'whatsapp_sessions.label as senderLabel',
+      'whatsapp_sessions.phone_number as senderPhone'
+    ])
+    .where('messages.status', '=', 'scheduled')
+    .orderBy('messages.scheduled_at', 'asc')
 
   if (organizationId !== undefined) {
     contactsQuery = contactsQuery.where('organization_id', '=', organizationId)
     groupsQuery = groupsQuery.where('organization_id', '=', organizationId)
     templatesQuery = templatesQuery.where('organization_id', '=', organizationId)
-    scheduledQuery = scheduledQuery.where('organization_id', '=', organizationId)
+    scheduledQuery = scheduledQuery.where('messages.organization_id', '=', organizationId)
   }
 
-  const [contacts, groups, templateRows, scheduled] = await Promise.all([
+  const [contacts, groups, templateRows, scheduledRows] = await Promise.all([
     contactsQuery.execute(),
     groupsQuery.execute(),
     templatesQuery.execute(),
@@ -37,7 +60,24 @@ async function loadFormData(templateId: number | null | undefined, organizationI
 
   const selectedTemplate = templateId ? (templates.find((t) => t.id === templateId) ?? null) : null
 
-  return { contacts, groups, templates, selectedTemplate, scheduled }
+  const scheduled = scheduledRows.map((r) => ({
+    ...r,
+    recipientName: recipientDisplayName(r.recipient_jid, r.contactName, r.groupSubject),
+    senderName: r.senderLabel ?? maskPhoneNumber(r.senderPhone) ?? null
+  }))
+
+  // Only sessions that are connected right now can be picked as the sender.
+  const sessions =
+    organizationId === undefined
+      ? []
+      : getConnectedSessionsForOrganization(organizationId).map((s) => ({
+          id: s.sessionId,
+          label: s.label,
+          phoneNumber: maskPhoneNumber(s.phoneNumber),
+          isPrimary: s.isPrimary
+        }))
+
+  return { contacts, groups, templates, selectedTemplate, scheduled, sessions }
 }
 
 scheduleRouter.get('/schedule', async (req, res) => {
@@ -74,23 +114,64 @@ scheduleRouter.post('/schedule', mediaUpload.single('file'), async (req, res) =>
     message_text,
     template_id,
     scheduled_date,
-    scheduled_time
+    scheduled_time,
+    whatsapp_session_id,
+    is_recurring,
+    recurring_end_date
   } = parsed.data
 
-  const scheduledAt = new Date(`${scheduled_date}T${scheduled_time}`)
-  if (Number.isNaN(scheduledAt.getTime())) {
-    fail('Enter a valid date and time.')
+  // Never trust whatsapp_session_id from the request body at face value —
+  // it must be one of this organization's own sessions, connected right
+  // now. With one connected session there's nothing to choose; with several
+  // and no explicit choice, the primary (listed first) is used.
+  const connectedSessions = getConnectedSessionsForOrganization(organizationId)
+  if (connectedSessions.length === 0) {
+    fail('WhatsApp is not connected. Connect it from the WhatsApp Connection page first.')
     return
   }
-  if (scheduledAt.getTime() <= Date.now() + 30_000) {
-    fail('Pick a time at least a minute from now.')
+  let sender = connectedSessions[0]!
+  if (whatsapp_session_id !== null) {
+    const chosen = connectedSessions.find((s) => s.sessionId === whatsapp_session_id)
+    if (!chosen) {
+      fail('The selected WhatsApp is not connected right now. Choose a connected WhatsApp.')
+      return
+    }
+    sender = chosen
+  }
+  const sock = getConnectedSocketForSession(sender.sessionId, organizationId)
+  if (!sock) {
+    fail('The selected WhatsApp is not connected right now. Choose a connected WhatsApp.')
     return
   }
 
-  const sock = getPrimarySocketForOrganization(organizationId)
-  if (!sock) {
-    fail('WhatsApp is not connected. Connect it from the WhatsApp Connection page first.')
+  if (is_recurring && message_type !== 'text') {
+    fail('Recurring messages support text only for now — choose "Text" as the message type.')
     return
+  }
+
+  let scheduledAt: Date | null = null
+  if (!is_recurring) {
+    scheduledAt = new Date(`${scheduled_date}T${scheduled_time}`)
+    if (Number.isNaN(scheduledAt.getTime())) {
+      fail('Enter a valid date and time.')
+      return
+    }
+    if (scheduledAt.getTime() <= Date.now() + 30_000) {
+      fail('Pick a time at least a minute from now.')
+      return
+    }
+  } else if (!/^\d{2}:\d{2}$/.test(scheduled_time)) {
+    fail('Enter a valid time.')
+    return
+  }
+
+  let recurringEndDate: Date | null = null
+  if (is_recurring && recurring_end_date) {
+    recurringEndDate = new Date(recurring_end_date)
+    if (Number.isNaN(recurringEndDate.getTime())) {
+      fail('Enter a valid end date, or leave it blank to repeat until turned off.')
+      return
+    }
   }
 
   const { recipients, skipped } = await resolveRecipients(
@@ -127,6 +208,45 @@ scheduleRouter.post('/schedule', mediaUpload.single('file'), async (req, res) =>
     return
   }
 
+  if (is_recurring) {
+    // One recurring_reminders row per recipient — it repeats daily at
+    // scheduled_time's time-of-day starting from its next occurrence (today
+    // if that time is still ahead, otherwise tomorrow), same as a "#sced"
+    // reminder typed on the phone. It shows up on the Recurring Reminders
+    // page, not in this page's own "Upcoming" list below.
+    const inserted = await db
+      .insertInto('recurring_reminders')
+      .values(
+        recipients.map((r) => ({
+          organization_id: organizationId,
+          recipient_jid: r.jid,
+          contact_id: r.contactId,
+          message_text: message_text!,
+          scheduled_time,
+          end_date: recurringEndDate,
+          whatsapp_session_id: sender.sessionId,
+          created_by_session_id: sender.sessionId
+        }))
+      )
+      .returning('id')
+      .execute()
+
+    for (const row of inserted) {
+      await scheduleNextRecurringReminder(row.id)
+    }
+
+    await recordAuditLog({
+      userId: req.user?.id ?? null,
+      action: 'recurring_reminder_created',
+      entityType: 'recurring_reminder',
+      metadata: { count: inserted.length, skippedCount: skipped.length, scheduledTime: scheduled_time, whatsappSessionId: sender.sessionId },
+      ipAddress: req.ip
+    })
+
+    res.status(201).json({ scheduled: 0, recurring: inserted.length, skipped })
+    return
+  }
+
   const inserted = await db
     .insertInto('messages')
     .values(
@@ -140,16 +260,17 @@ scheduleRouter.post('/schedule', mediaUpload.single('file'), async (req, res) =>
         media_path: mediaResult.media.mediaPath,
         template_id,
         status: 'scheduled' as const,
-        scheduled_at: scheduledAt,
+        scheduled_at: scheduledAt!,
         created_by: req.user?.id ?? null,
-        organization_id: organizationId
+        organization_id: organizationId,
+        whatsapp_session_id: sender.sessionId
       }))
     )
     .returning('id')
     .execute()
 
   for (const row of inserted) {
-    const jobId = await enqueueSendJob(row.id, { startAfter: scheduledAt })
+    const jobId = await enqueueSendJob(row.id, { startAfter: scheduledAt! })
     await db.updateTable('messages').set({ pg_boss_job_id: jobId }).where('id', '=', row.id).execute()
   }
 
@@ -157,11 +278,11 @@ scheduleRouter.post('/schedule', mediaUpload.single('file'), async (req, res) =>
     userId: req.user?.id ?? null,
     action: 'message_scheduled',
     entityType: 'message',
-    metadata: { count: inserted.length, skippedCount: skipped.length, scheduledAt: scheduledAt.toISOString() },
+    metadata: { count: inserted.length, skippedCount: skipped.length, scheduledAt: scheduledAt!.toISOString(), whatsappSessionId: sender.sessionId },
     ipAddress: req.ip
   })
 
-  res.status(201).json({ scheduled: inserted.length, skipped })
+  res.status(201).json({ scheduled: inserted.length, recurring: 0, skipped })
 })
 
 scheduleRouter.delete('/schedule/:id', async (req, res) => {
