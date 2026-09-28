@@ -246,7 +246,18 @@ export async function startConnection(sessionId: number): Promise<void> {
   if (!row) return
 
   const runtime = ensureRuntime(row)
-  if (runtime.starting || runtime.snapshot.status === 'connected') return
+  // On a fresh process boot, ensureRuntime() seeds the snapshot straight
+  // from the DB row (snapshotFromRow) — which can still say 'connected'
+  // from before this process started, even though `runtime.sock` is null
+  // and no socket has ever been created in THIS process. Trusting that
+  // stale status alone used to skip reconnecting entirely, leaving every
+  // session that was connected at the last restart permanently zombied
+  // (DB says "connected" forever, but nothing is ever sent or received)
+  // until something else forced a reconnect. Requiring a real, live
+  // `runtime.sock` alongside the 'connected' status is what actually makes
+  // this "don't reconnect, we're already connected" — not just "the last
+  // process to touch this row happened to leave it saying connected".
+  if (runtime.starting || (runtime.snapshot.status === 'connected' && runtime.sock)) return
   runtime.starting = true
 
   try {
@@ -433,7 +444,9 @@ async function clearAuthState(sessionId: number): Promise<void> {
 
 export async function requestConnect(sessionId: number): Promise<void> {
   const runtime = runtimes.get(sessionId)
-  if (runtime && (runtime.snapshot.status === 'connected' || runtime.snapshot.status === 'connecting' || runtime.starting)) return
+  // Same stale-status caveat as startConnection() above: only a 'connected'
+  // status backed by an actual live socket should block a manual reconnect.
+  if (runtime && ((runtime.snapshot.status === 'connected' && runtime.sock) || runtime.snapshot.status === 'connecting' || runtime.starting)) return
   await startConnection(sessionId)
 }
 
