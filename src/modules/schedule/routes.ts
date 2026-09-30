@@ -12,6 +12,7 @@ import { enqueueSendJob, cancelSendJob } from '../../queue/boss.js'
 import { resolveRecipients, resolveMedia } from '../messages/shared.js'
 import { scheduleNextRecurringReminder } from '../../queue/recurringReminders.js'
 import { recipientDisplayName } from '../../lib/recipientDisplay.js'
+import { stripScheduleTag } from '../../whatsapp/recurringReminderParser.js'
 
 export const scheduleRouter = Router()
 
@@ -117,7 +118,8 @@ scheduleRouter.post('/schedule', mediaUpload.single('file'), async (req, res) =>
     scheduled_time,
     whatsapp_session_id,
     is_recurring,
-    recurring_end_date
+    recurring_end_date,
+    recurring_interval_days
   } = parsed.data
 
   // Never trust whatsapp_session_id from the request body at face value —
@@ -174,6 +176,11 @@ scheduleRouter.post('/schedule', mediaUpload.single('file'), async (req, res) =>
     }
   }
 
+  if (is_recurring && (!Number.isInteger(recurring_interval_days) || recurring_interval_days < 1)) {
+    fail('Enter how many days between sends (1 or more).')
+    return
+  }
+
   const { recipients, skipped } = await resolveRecipients(
     sock,
     {
@@ -209,11 +216,19 @@ scheduleRouter.post('/schedule', mediaUpload.single('file'), async (req, res) =>
   }
 
   if (is_recurring) {
-    // One recurring_reminders row per recipient — it repeats daily at
-    // scheduled_time's time-of-day starting from its next occurrence (today
-    // if that time is still ahead, otherwise tomorrow), same as a "#sced"
-    // reminder typed on the phone. It shows up on the Recurring Reminders
-    // page, not in this page's own "Upcoming" list below.
+    // One recurring_reminders row per recipient — it repeats every
+    // recurring_interval_days (1 = daily, the default) at scheduled_time's
+    // time-of-day, starting from its next occurrence, same mechanics as a
+    // "#sced" reminder typed on the phone. It shows up on the Recurring
+    // Reminders page, not in this page's own "Upcoming" list below.
+    //
+    // stripScheduleTag guards against someone pasting a WhatsApp-style
+    // "... #sced till 30-11-26" draft straight into this box out of habit —
+    // this form already has its own end-date/interval fields for that, so
+    // a leftover tag would otherwise get sent verbatim as part of the
+    // message. Ordinary text is returned unchanged.
+    const cleanedMessageText = stripScheduleTag(message_text!)
+
     const inserted = await db
       .insertInto('recurring_reminders')
       .values(
@@ -221,9 +236,10 @@ scheduleRouter.post('/schedule', mediaUpload.single('file'), async (req, res) =>
           organization_id: organizationId,
           recipient_jid: r.jid,
           contact_id: r.contactId,
-          message_text: message_text!,
+          message_text: cleanedMessageText,
           scheduled_time,
           end_date: recurringEndDate,
+          interval_days: recurring_interval_days,
           whatsapp_session_id: sender.sessionId,
           created_by_session_id: sender.sessionId
         }))
@@ -239,7 +255,13 @@ scheduleRouter.post('/schedule', mediaUpload.single('file'), async (req, res) =>
       userId: req.user?.id ?? null,
       action: 'recurring_reminder_created',
       entityType: 'recurring_reminder',
-      metadata: { count: inserted.length, skippedCount: skipped.length, scheduledTime: scheduled_time, whatsappSessionId: sender.sessionId },
+      metadata: {
+        count: inserted.length,
+        skippedCount: skipped.length,
+        scheduledTime: scheduled_time,
+        intervalDays: recurring_interval_days,
+        whatsappSessionId: sender.sessionId
+      },
       ipAddress: req.ip
     })
 

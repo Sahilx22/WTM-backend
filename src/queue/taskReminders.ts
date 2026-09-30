@@ -71,7 +71,7 @@ export function nextWorkingHourSlot(n: number, startStr: string, endStr: string,
 
 // Once-every-N-days reminders ("1IN2D"/"1IN3D") — N days from `from`, snapped
 // to the daily anchor time so they land at a predictable hour.
-function nextIntervalDaysTime(intervalDays: number, anchorTimeStr: string, from: Date = new Date()): Date {
+export function nextIntervalDaysTime(intervalDays: number, anchorTimeStr: string, from: Date = new Date()): Date {
   const { hour, minute } = parseTimeStr(anchorTimeStr, 9, 30)
   const target = new Date(from)
   target.setDate(target.getDate() + intervalDays)

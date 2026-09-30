@@ -8,25 +8,44 @@ export interface ParsedTask {
   timesPerDay: number | null
   intervalDays: number | null
   targetDate: Date | null
+  // Set when the message ends in "rec" — a standing task: reminders keep
+  // firing on whatever cadence was set (timesPerDay/intervalDays above,
+  // unaffected by this flag), but it never leaves "pending" — a thumbs-up,
+  // a "done" reply, /complete, and the portal's own completion/needs-review
+  // actions are all no-ops for it (see lib/taskCompletion.ts). Distinct
+  // from /recur's is_recurring/recurrence_* (which recreate a brand-new
+  // task some time after the current one IS completed) — this one is a
+  // single task that simply never completes at all.
+  neverCompletes: boolean
 }
 
 const TASK_TAG_RE = /^#task\s+(.+)$/is
 
-// Exported for reuse by commandParser.ts's `/remind`/`/category` commands,
-// which apply this same shorthand to an existing task instead of a
-// freshly-created one.
+// Exported for reuse by commandParser.ts's `/remind`/`/category`/`/recur`
+// commands, which apply this same shorthand to an existing task instead of
+// a freshly-created one.
 export const CATEGORY_RE = /@(\w+)/ // e.g. "@acc" = accounts, "@pur" = purchase — free-form, no fixed list
 export const PRIORITY_RE = /\bP([1-4])\b/i
 export const TIMES_PER_DAY_RE = /\b(\d+)\s*TAD\b/i // e.g. "2TAD" = twice a day
 export const INTERVAL_DAYS_RE = /\b1\s*IN\s*(\d+)\s*D\b/i // e.g. "1IN3D" = once every 3 days
 export const TARGET_DATE_RE = new RegExp(`\\buntil\\s+(${SHORT_DATE_RE.source})\\b`, 'i') // "until dd-mm-yy"
+export const RECUR_RE = /\bevery\s+(\d+)\s+(day|days|week|weeks)\b/i // "every 14 days" / "every 2 weeks" — /recur only, see commandParser.ts
+export const AT_TIME_RE = /\bat\s+([01]\d|2[0-3]):([0-5]\d)\b/i // "at 09:00" — /recur only, see commandParser.ts
+
+// "rec" as the very last word (case-insensitive) — anchored to the end, not
+// matched anywhere in the message, so an ordinary task name that happens to
+// contain "rec" (e.g. abbreviating "record") is never mistaken for the tag.
+const STANDING_TASK_RE = /\brec\b\s*$/i
 
 // Parses a phone-typed message like:
 //   "#task Update tensile rate calculator @acc P1 2TAD until 01-09-26"
 //   "#task Follow up with vendor @pur 1IN2D"
+//   "#task Water the plants 1IN2D rec"
 // into a task name plus category, priority (defaults P3), reminder cadence,
-// and an optional target date. Keywords can appear in any order — whichever
-// matched keyword appears first in the text is where the task name ends.
+// an optional target date, and whether it's a standing ("rec") task. Every
+// keyword except "rec" can appear in any order — whichever matched keyword
+// appears first in the text is where the task name ends; "rec" itself must
+// be the last word, so it's never part of that ambiguity.
 export function parseTaskMessage(text: string): ParsedTask | null {
   const tagMatch = text.trim().match(TASK_TAG_RE)
   if (!tagMatch) return null
@@ -39,8 +58,9 @@ export function parseTaskMessage(text: string): ParsedTask | null {
   const tadMatch = body.match(TIMES_PER_DAY_RE)
   const intervalMatch = body.match(INTERVAL_DAYS_RE)
   const untilMatch = body.match(TARGET_DATE_RE)
+  const recMatch = body.match(STANDING_TASK_RE)
 
-  const cutPoints = [categoryMatch?.index, priorityMatch?.index, tadMatch?.index, intervalMatch?.index, untilMatch?.index].filter(
+  const cutPoints = [categoryMatch?.index, priorityMatch?.index, tadMatch?.index, intervalMatch?.index, untilMatch?.index, recMatch?.index].filter(
     (i): i is number => i !== undefined
   )
   const nameEnd = cutPoints.length > 0 ? Math.min(...cutPoints) : body.length
@@ -53,8 +73,9 @@ export function parseTaskMessage(text: string): ParsedTask | null {
   const timesPerDay = tadMatch?.[1] ? Number(tadMatch[1]) : null
   const intervalDays = intervalMatch?.[1] ? Number(intervalMatch[1]) : null
   const targetDate = untilMatch?.[1] ? parseShortDate(untilMatch[1]) : null
+  const neverCompletes = recMatch !== null
 
-  return { name, category, priority, timesPerDay, intervalDays, targetDate }
+  return { name, category, priority, timesPerDay, intervalDays, targetDate, neverCompletes }
 }
 
 const THUMBS_UP_VARIANTS = new Set(['👍', '👍🏻', '👍🏼', '👍🏽', '👍🏾', '👍🏿'])

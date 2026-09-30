@@ -37,6 +37,7 @@ export async function handleRecurringReminderMessage(
       message_text: parsed.text,
       scheduled_time: scheduledTime,
       end_date: parsed.endDate,
+      interval_days: parsed.intervalDays,
       wa_message_id: m.key.id ?? null,
       created_by_session_id: sessionId,
       // Reply back through the same number it was typed into daily, not
@@ -53,7 +54,7 @@ export async function handleRecurringReminderMessage(
     action: 'recurring_reminder_created',
     entityType: 'recurring_reminder',
     entityId: created.id,
-    metadata: { recipientJid: m.key.remoteJid, endDate: parsed.endDate, sessionId }
+    metadata: { recipientJid: m.key.remoteJid, endDate: parsed.endDate, intervalDays: parsed.intervalDays, sessionId }
   })
 
   // Deliberately silent — no WhatsApp reply. The reminder still shows up on

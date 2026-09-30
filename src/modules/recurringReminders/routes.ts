@@ -19,6 +19,7 @@ recurringRemindersRouter.get('/recurring-reminders', async (req, res) => {
       'recurring_reminders.recipient_jid',
       'recurring_reminders.message_text',
       'recurring_reminders.scheduled_time',
+      'recurring_reminders.interval_days',
       'recurring_reminders.end_date',
       'recurring_reminders.enabled',
       'recurring_reminders.last_sent_at',

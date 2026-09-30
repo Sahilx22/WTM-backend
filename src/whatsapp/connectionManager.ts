@@ -29,6 +29,7 @@ import { handleMessageForTasks } from './taskEngine.js'
 import { handleCommandMessage } from './commandEngine.js'
 import { persistChatMessage } from './chatMessages.js'
 import { handleRecurringReminderMessage } from './recurringReminderEngine.js'
+import { handleReportSubmissionMessage } from './reportSubmissionEngine.js'
 import type { ConnectionStatus, WhatsappSession } from '../db/schema.js'
 
 const logger = pino({ level: isProduction ? 'error' : 'warn' })
@@ -385,6 +386,11 @@ export async function startConnection(sessionId: number): Promise<void> {
           await handleCommandMessage(sock, runtime.snapshot.waJid, m, runtime.snapshot.organizationId)
         } catch (err) {
           logger.warn({ err, key: m.key }, 'failed processing message for command engine')
+        }
+        try {
+          await handleReportSubmissionMessage(sock, m, runtime.snapshot.organizationId)
+        } catch (err) {
+          logger.warn({ err, key: m.key }, 'failed processing message for report submission engine')
         }
         try {
           await persistChatMessage(sock, m, runtime.snapshot.organizationId)

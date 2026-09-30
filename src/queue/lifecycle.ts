@@ -10,6 +10,7 @@ import {
   startRecurringReminderWorker,
   scheduleUnscheduledRecurringReminders
 } from './recurringReminders.js'
+import { initReportCheckQueue, startReportCheckWorker, scheduleUnscheduledReportOccurrences } from './reportSubmissions.js'
 import { connectionEvents, isAnySessionConnected } from '../whatsapp/connectionManager.js'
 import { isProduction } from '../config/env.js'
 import type { TaskSettings } from '../db/schema.js'
@@ -63,6 +64,11 @@ async function registerWorkers(): Promise<void> {
   // duplicate-digest bug, so this queue just avoids it outright.
   await initRecurringReminderQueue()
   await startRecurringReminderWorker()
+  // Same "no bulk re-apply on reconnect" reasoning as recurring reminders
+  // just above — each occurrence's one pending job lives in pg-boss's own
+  // queue table.
+  await initReportCheckQueue()
+  await startReportCheckWorker()
 }
 
 // How long to wait before trying again after a failed start (e.g. the
@@ -88,6 +94,7 @@ export async function ensureQueuesRunning(): Promise<void> {
     // Only reminders with no pending job — never a bulk re-apply (see the
     // note in registerWorkers()).
     await scheduleUnscheduledRecurringReminders()
+    await scheduleUnscheduledReportOccurrences()
     logger.info('queue workers started — a WhatsApp session is connected')
   } catch (err) {
     logger.error({ err }, 'failed to start queue workers — will retry shortly')

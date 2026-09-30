@@ -11,14 +11,18 @@ import type { MessageType } from '../db/schema.js'
 
 const logger = pino({ level: isProduction ? 'error' : 'warn' })
 
-interface MappedContent {
+export interface MappedContent {
   messageType: MessageType
   messageText: string | null
   mediaBuffer: Buffer | null
   mediaMimetype: string | null
 }
 
-async function mapContent(sock: WASocket, m: WAMessage): Promise<MappedContent | null> {
+// Exported for reuse by whatsapp/reportSubmissionEngine.ts, which needs the
+// exact same "download whatever media type this inbound message carries,
+// falling back to a text placeholder if the download fails" logic — kept in
+// one place rather than copied.
+export async function mapContent(sock: WASocket, m: WAMessage): Promise<MappedContent | null> {
   const msg = m.message
   if (!msg) return null
 

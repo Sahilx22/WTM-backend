@@ -1,6 +1,6 @@
 import type { ReportPeriod } from '../reports/taskMetrics.js'
 import type { TaskStatus, TaskPriority, RecurrenceUnit } from '../db/schema.js'
-import { TIMES_PER_DAY_RE, INTERVAL_DAYS_RE, TARGET_DATE_RE, PRIORITY_RE, CATEGORY_RE } from './taskParser.js'
+import { TIMES_PER_DAY_RE, INTERVAL_DAYS_RE, TARGET_DATE_RE, PRIORITY_RE, CATEGORY_RE, RECUR_RE, AT_TIME_RE } from './taskParser.js'
 import { SHORT_DATE_RE, parseShortDate } from '../lib/dateFormat.js'
 
 export type ParsedCommand =
@@ -44,8 +44,6 @@ const STATUS_KEYWORDS: Record<string, TaskStatus> = {
 
 const FROM_RE = new RegExp(`\\bfrom\\s+(${SHORT_DATE_RE.source})\\b`, 'i')
 const TO_RE = new RegExp(`\\bto\\s+(${SHORT_DATE_RE.source})\\b`, 'i')
-const RECUR_RE = /\bevery\s+(\d+)\s+(day|days|week|weeks)\b/i
-const AT_TIME_RE = /\bat\s+([01]\d|2[0-3]):([0-5]\d)\b/i
 const EXACT_SHORT_DATE_RE = new RegExp(`^${SHORT_DATE_RE.source}$`)
 
 // Shared by /status and /report — pulls out "from dd-mm-yy" / "to dd-mm-yy"

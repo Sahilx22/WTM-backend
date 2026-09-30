@@ -347,6 +347,13 @@ export interface TasksTable {
   // tasks created from one shared group message (multiple mentions) each
   // resolve their own contact name and be completed independently.
   assigned_jid: string | null
+  // A "standing" task (the "rec" tag on #task) — reminders keep firing on
+  // its own reminder_times_per_day/reminder_interval_days, but the task
+  // itself never leaves "pending": completeTask() and markNeedsReview()
+  // (lib/taskCompletion.ts) both no-op for it. Distinct from is_recurring
+  // above, which recreates a brand-new task some time after this one IS
+  // completed — this is one task that simply never completes at all.
+  never_completes: Generated<boolean>
 }
 
 export interface TaskMessagesTable {
@@ -426,6 +433,10 @@ export interface RecurringRemindersTable {
   // reminder created by typing "#sced" (send back through the same number
   // it was typed into), or chosen explicitly when created from the portal.
   whatsapp_session_id: number | null
+  // How many days between sends — 1 (the default) is the original
+  // daily-only behavior; "#sced 1IN15D" (or the portal's own interval
+  // field) sets it higher, the same "once every N days" concept tasks have.
+  interval_days: Generated<number>
   created_at: Generated<Date>
   updated_at: Generated<Date>
 }
@@ -438,6 +449,52 @@ export interface RecurringReminderSendsTable {
   error_message: string | null
   wa_message_id: string | null
   sent_at: Generated<Date>
+}
+
+export type ReportScheduleType = 'weekly' | 'interval'
+export type ReportSubmissionStatus = 'pending' | 'submitted' | 'missed'
+
+export interface ReportDefinitionsTable {
+  id: Generated<number>
+  organization_id: number | null
+  name: string
+  description: string | null
+  recipient_jid: string
+  contact_id: number | null
+  // 'weekly' uses day_of_week (0=Sunday..6=Saturday); 'interval' uses
+  // interval_days — exactly one of the two is set, enforced at the
+  // application layer, same convention as tasks' reminder_times_per_day vs
+  // reminder_interval_days.
+  schedule_type: ReportScheduleType
+  day_of_week: number | null
+  interval_days: number | null
+  // "HH:MM" — the wall-clock time each occurrence is due by.
+  due_time: string
+  enabled: Generated<boolean>
+  next_due_at: Date | null
+  next_due_job_id: string | null
+  // Which linked WhatsApp sends the reminder for this report — null means
+  // the organization's primary session.
+  whatsapp_session_id: number | null
+  created_by_session_id: number | null
+  created_by: number | null
+  created_at: Generated<Date>
+  updated_at: Generated<Date>
+}
+
+export interface ReportSubmissionsTable {
+  id: Generated<number>
+  report_definition_id: number
+  organization_id: number | null
+  due_at: Date
+  status: Generated<ReportSubmissionStatus>
+  reminder_sent_at: Date | null
+  submitted_at: Date | null
+  submission_text: string | null
+  submission_media_path: string | null
+  submission_media_mimetype: string | null
+  wa_message_id: string | null
+  created_at: Generated<Date>
 }
 
 export interface Database {
@@ -466,6 +523,8 @@ export interface Database {
   chat_messages: ChatMessagesTable
   recurring_reminders: RecurringRemindersTable
   recurring_reminder_sends: RecurringReminderSendsTable
+  report_definitions: ReportDefinitionsTable
+  report_submissions: ReportSubmissionsTable
 }
 
 export type Organization = Selectable<OrganizationsTable>
@@ -539,3 +598,10 @@ export type NewChatMessage = Insertable<ChatMessagesTable>
 export type RecurringReminder = Selectable<RecurringRemindersTable>
 export type NewRecurringReminder = Insertable<RecurringRemindersTable>
 export type RecurringReminderUpdate = Updateable<RecurringRemindersTable>
+
+export type ReportDefinition = Selectable<ReportDefinitionsTable>
+export type NewReportDefinition = Insertable<ReportDefinitionsTable>
+export type ReportDefinitionUpdate = Updateable<ReportDefinitionsTable>
+
+export type ReportSubmission = Selectable<ReportSubmissionsTable>
+export type NewReportSubmission = Insertable<ReportSubmissionsTable>

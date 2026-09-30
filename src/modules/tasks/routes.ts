@@ -1,7 +1,7 @@
 import { Router } from 'express'
 import { db } from '../../db/index.js'
 import { recordAuditLog } from '../../lib/auditLog.js'
-import { completeTask } from '../../lib/taskCompletion.js'
+import { completeTask, markNeedsReview } from '../../lib/taskCompletion.js'
 import { cancelTaskReminder, scheduleNextReminder } from '../../queue/taskReminders.js'
 import { recipientDisplayName } from '../../lib/recipientDisplay.js'
 import { resolveContactId } from '../../whatsapp/taskEngine.js'
@@ -26,6 +26,7 @@ async function loadTasks(status: string, reminder: string, category: string, rec
       'tasks.reminders_enabled',
       'tasks.target_date',
       'tasks.status',
+      'tasks.never_completes',
       'tasks.last_reminder_sent_at',
       'tasks.next_reminder_at',
       'tasks.created_at',
@@ -258,26 +259,12 @@ tasksRouter.post('/tasks/:id/complete', async (req, res) => {
 
 tasksRouter.post('/tasks/:id/needs-review', async (req, res) => {
   const id = Number(req.params.id)
-  let taskQuery = db.selectFrom('tasks').select(['next_reminder_job_id']).where('id', '=', id)
+  let taskQuery = db.selectFrom('tasks').select(['id', 'status', 'next_reminder_job_id', 'never_completes']).where('id', '=', id)
   if (req.user?.organizationId) taskQuery = taskQuery.where('organization_id', '=', req.user.organizationId)
   const task = await taskQuery.executeTakeFirst()
 
   if (task) {
-    await cancelTaskReminder(task.next_reminder_job_id)
-    await db
-      .updateTable('tasks')
-      .set({ status: 'needs_review', next_reminder_job_id: null, next_reminder_at: null, updated_at: new Date() })
-      .where('id', '=', id)
-      .execute()
-
-    await recordAuditLog({
-      userId: req.user?.id ?? null,
-      action: 'task_marked_needs_review',
-      entityType: 'task',
-      entityId: id,
-      metadata: { via: 'manual' },
-      ipAddress: req.ip
-    })
+    await markNeedsReview(task, { userId: req.user?.id ?? null, via: 'manual', ipAddress: req.ip })
   }
 
   res.status(204).end()

@@ -80,17 +80,26 @@ export async function applyDigestSchedule(organizationId: number, settings: Task
 // unreadably long message — the rest are summarized as "…and N more".
 const MAX_PENDING_NAMES_LISTED = 25
 
+export interface PendingTaskSummary {
+  name: string
+  // A standing ("rec") task — see taskParser.ts/lib/taskCompletion.ts. It
+  // never leaves this pending list on its own, so it's labeled here — the
+  // whole reason for the label is so the recipient knows that's expected,
+  // not something they forgot to close out.
+  neverCompletes: boolean
+}
+
 // The pending tasks are listed by name (not just counted) so the recipient
 // can see exactly which tasks are still open; completed and in-review stay
 // as plain counts.
-export function buildDailyOverviewText(completed: number, pendingNames: string[], needsReview: number): string {
-  const lines = ['📋 *Your task overview for today*', `✅ Completed: ${completed}`, `🕓 Pending: ${pendingNames.length}`]
+export function buildDailyOverviewText(completed: number, pendingTasks: PendingTaskSummary[], needsReview: number): string {
+  const lines = ['📋 *Your task overview for today*', `✅ Completed: ${completed}`, `🕓 Pending: ${pendingTasks.length}`]
 
-  pendingNames.slice(0, MAX_PENDING_NAMES_LISTED).forEach((name, i) => {
-    lines.push(`   ${i + 1}. ${name}`)
+  pendingTasks.slice(0, MAX_PENDING_NAMES_LISTED).forEach((task, i) => {
+    lines.push(`   ${i + 1}. ${task.name}${task.neverCompletes ? ' (recurring)' : ''}`)
   })
-  if (pendingNames.length > MAX_PENDING_NAMES_LISTED) {
-    lines.push(`   …and ${pendingNames.length - MAX_PENDING_NAMES_LISTED} more`)
+  if (pendingTasks.length > MAX_PENDING_NAMES_LISTED) {
+    lines.push(`   …and ${pendingTasks.length - MAX_PENDING_NAMES_LISTED} more`)
   }
 
   lines.push(`🔎 In review: ${needsReview}`)
@@ -130,16 +139,16 @@ async function sendDailyOverview(organizationId: number): Promise<void> {
     try {
       const rows = await db
         .selectFrom('tasks')
-        .select(['name', 'status'])
+        .select(['name', 'status', 'never_completes'])
         .where('recipient_jid', '=', recipient_jid)
         .where('organization_id', '=', organizationId)
         .orderBy('created_at', 'asc')
         .execute()
       const completed = rows.filter((r) => r.status === 'completed').length
-      const pendingNames = rows.filter((r) => r.status === 'pending').map((r) => r.name)
+      const pendingTasks = rows.filter((r) => r.status === 'pending').map((r) => ({ name: r.name, neverCompletes: r.never_completes }))
       const needsReview = rows.filter((r) => r.status === 'needs_review').length
 
-      await sock.sendMessage(recipient_jid, { text: buildDailyOverviewText(completed, pendingNames, needsReview) })
+      await sock.sendMessage(recipient_jid, { text: buildDailyOverviewText(completed, pendingTasks, needsReview) })
     } catch (err) {
       logger.warn({ err, organizationId, recipient_jid }, 'failed to send daily overview')
     }

@@ -3,9 +3,9 @@ import pino from 'pino'
 import { db } from '../db/index.js'
 import { isProduction } from '../config/env.js'
 import { parseTaskMessage, isThumbsUp, isDoneReply } from './taskParser.js'
-import { scheduleNextReminder, cancelTaskReminder } from '../queue/taskReminders.js'
+import { scheduleNextReminder } from '../queue/taskReminders.js'
 import { recordAuditLog } from '../lib/auditLog.js'
-import { completeTask } from '../lib/taskCompletion.js'
+import { completeTask, markNeedsReview } from '../lib/taskCompletion.js'
 
 const logger = pino({ level: isProduction ? 'error' : 'warn' })
 
@@ -115,7 +115,8 @@ async function createTasksFromPhoneMessage(
         target_date: parsed.targetDate,
         status: 'pending',
         created_by_session_id: sessionId,
-        organization_id: organizationId
+        organization_id: organizationId,
+        never_completes: parsed.neverCompletes
       })
       .returning('id')
       .executeTakeFirstOrThrow()
@@ -146,6 +147,7 @@ async function createTasksFromPhoneMessage(
         timesPerDay: parsed.timesPerDay,
         intervalDays: parsed.intervalDays,
         targetDate: parsed.targetDate,
+        neverCompletes: parsed.neverCompletes,
         recipientJid,
         sessionId,
         assignedJid: assignee.assignedJid
@@ -159,6 +161,7 @@ interface TaskCandidate {
   status: string
   next_reminder_job_id: string | null
   assigned_jid: string | null
+  never_completes: boolean
 }
 
 // Finds which task(s) a given WhatsApp message (the original #task message,
@@ -175,7 +178,7 @@ async function findTaskMessageCandidates(waMessageId: string, organizationId: nu
   let query = db
     .selectFrom('task_messages')
     .innerJoin('tasks', 'tasks.id', 'task_messages.task_id')
-    .select(['tasks.id', 'tasks.status', 'tasks.next_reminder_job_id', 'tasks.assigned_jid'])
+    .select(['tasks.id', 'tasks.status', 'tasks.next_reminder_job_id', 'tasks.assigned_jid', 'tasks.never_completes'])
     .where('task_messages.wa_message_id', '=', waMessageId)
   query = organizationId !== null ? query.where('tasks.organization_id', '=', organizationId) : query.where('tasks.organization_id', 'is', null)
   return query.execute()
@@ -269,25 +272,10 @@ async function handleThumbsUpReaction(
   // one who actually reacted should have their own task moved along, never
   // all of them, and never a guess if we can't tell who reacted.
   const task = await matchCandidateToParticipant(sock, candidates, reactorJid)
-  if (!task || task.status !== 'pending') return
+  if (!task) return
 
-  await cancelTaskReminder(task.next_reminder_job_id)
-
-  await db
-    .updateTable('tasks')
-    .set({ status: 'needs_review', next_reminder_job_id: null, updated_at: new Date() })
-    .where('id', '=', task.id)
-    .execute()
-
+  await markNeedsReview(task, { via: 'whatsapp_reaction' })
   logger.info({ taskId: task.id }, 'task marked needs_review via thumbs-up reaction')
-
-  await recordAuditLog({
-    userId: null,
-    action: 'task_marked_needs_review',
-    entityType: 'task',
-    entityId: task.id,
-    metadata: { via: 'whatsapp_reaction' }
-  })
 }
 
 // Called for every message our socket sees (both messages we send from the

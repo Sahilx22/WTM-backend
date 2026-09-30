@@ -4,7 +4,7 @@ import pino from 'pino'
 import { boss, isBossStarted } from './boss.js'
 import { db } from '../db/index.js'
 import { getPrimarySocketForOrganization, getConnectedSocketForSession } from '../whatsapp/connectionManager.js'
-import { nextDailyAnchorTime } from './taskReminders.js'
+import { nextDailyAnchorTime, nextIntervalDaysTime } from './taskReminders.js'
 import { isProduction } from '../config/env.js'
 
 const logger = pino({ level: isProduction ? 'error' : 'warn' })
@@ -77,10 +77,13 @@ async function turnOff(reminderId: number): Promise<void> {
     .execute()
 }
 
-// Schedules (or reschedules) a recurring reminder's next daily occurrence at
-// its own fixed scheduled_time. Called once when a reminder is created
-// (whatsapp/recurringReminderEngine.ts), once after each successful/skipped
-// send (below), and when re-enabled from the portal — deliberately NOT
+// Schedules (or reschedules) a recurring reminder's next occurrence at its
+// own fixed scheduled_time — either "next time HH:MM comes around" (daily,
+// interval_days === 1, the default) or "interval_days days from right now,
+// snapped to HH:MM" (matching how tasks' own "1IN<N>D" reminders anchor).
+// Called once when a reminder is created (whatsapp/recurringReminderEngine.ts
+// or modules/schedule/routes.ts), once after each successful/skipped send
+// (below), and when re-enabled from the portal — deliberately NOT
 // bulk-reapplied on every WhatsApp reconnect the way queue/scheduledDigests.ts
 // used to be (see migration 042's comment) — pg-boss keeps each reminder's
 // one pending job in its own Postgres-backed queue table, so it's simply
@@ -100,7 +103,10 @@ export async function scheduleNextRecurringReminder(reminderId: number): Promise
     return
   }
 
-  const nextAt = nextDailyAnchorTime(reminder.scheduled_time)
+  const nextAt =
+    reminder.interval_days <= 1
+      ? nextDailyAnchorTime(reminder.scheduled_time)
+      : nextIntervalDaysTime(reminder.interval_days, reminder.scheduled_time)
   const jobId = await enqueueRecurringReminder(reminderId, nextAt)
   await db.updateTable('recurring_reminders').set({ next_send_job_id: jobId, next_send_at: nextAt }).where('id', '=', reminderId).execute()
 }
@@ -149,7 +155,9 @@ async function processRecurringReminder(reminderId: number): Promise<void> {
   let waMessageId: string | null = null
   let sendError: string | null = null
   try {
-    const result = await sock.sendMessage(reminder.recipient_jid, { text: `🔁 ${reminder.message_text}` })
+    // Sent as plain text — no emoji or system tag prefix, so the recipient
+    // just sees the message itself, exactly as it would look from a human.
+    const result = await sock.sendMessage(reminder.recipient_jid, { text: reminder.message_text })
     waMessageId = result?.key?.id ?? null
   } catch (err) {
     sendError = err instanceof Error ? err.message : 'Unknown send error'

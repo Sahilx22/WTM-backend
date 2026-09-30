@@ -56,7 +56,13 @@ export const scheduleMessageSchema = sendMessageSchema
     recurring_end_date: z
       .string()
       .optional()
-      .transform((v) => (v ? v : null))
+      .transform((v) => (v ? v : null)),
+    // How many days between sends — 1 (the default, omitted) is daily; the
+    // same "1IN<N>D" concept tasks and "#sced" already have.
+    recurring_interval_days: z
+      .string()
+      .optional()
+      .transform((v) => (v ? Number(v) : 1))
   })
   .refine((data) => data.is_recurring || data.scheduled_date.length > 0, { message: 'Pick a date', path: ['scheduled_date'] })
 
