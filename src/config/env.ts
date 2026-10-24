@@ -11,7 +11,14 @@ const envSchema = z.object({
   S3_SECRET_ACCESS_KEY: z.string().min(1, 'S3_SECRET_ACCESS_KEY is required'),
   S3_ENDPOINT: z.string().min(1, 'S3_ENDPOINT is required'),
   S3_REGION: z.string().min(1, 'S3_REGION is required'),
-  S3_BUCKET: z.string().min(1, 'S3_BUCKET is required')
+  S3_BUCKET: z.string().min(1, 'S3_BUCKET is required'),
+  // The "@ai" WhatsApp assistant (src/ai/). Optional — without a key the
+  // assistant just replies that it isn't configured; nothing else changes.
+  OPENAI_API_KEY: z.string().min(1).optional(),
+  OPENAI_MODEL: z.string().min(1).default('gpt-6-luna'),
+  OPENAI_REASONING_EFFORT: z.enum(['none', 'minimal', 'low', 'medium', 'high']).default('low'),
+  // Per-organization cap on @ai requests, to bound API cost.
+  AI_MAX_REQUESTS_PER_HOUR: z.coerce.number().int().positive().default(60)
 })
 
 const parsed = envSchema.safeParse(process.env)

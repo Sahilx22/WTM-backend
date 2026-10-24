@@ -2,7 +2,8 @@ import express from 'express'
 import cors from 'cors'
 import helmet from 'helmet'
 import { env } from './config/env.js'
-import { requireAuth } from './auth/middleware.js'
+import { requireAuth, requireSuperAdmin } from './auth/middleware.js'
+import { buildHealthReport } from './whatsapp/watchdog.js'
 import { authRouter } from './auth/routes.js'
 import { connectionRouter } from './modules/connection/routes.js'
 import { contactsRouter } from './modules/contacts/routes.js'
@@ -22,6 +23,7 @@ import { sharedAccessRouter } from './modules/sharedAccess/routes.js'
 import { chatRouter } from './modules/chat/routes.js'
 import { recurringRemindersRouter } from './modules/recurringReminders/routes.js'
 import { reportTrackerRouter } from './modules/reportTracker/routes.js'
+import { aiRouter } from './modules/ai/routes.js'
 import { notFound, errorHandler } from './middleware/errorHandler.js'
 import { writeRateLimit } from './middleware/writeRateLimit.js'
 
@@ -47,9 +49,23 @@ app.use(cors({ origin: env.FRONTEND_ORIGIN }))
 app.use(express.urlencoded({ extended: true, limit: '1mb' }))
 app.use(express.json({ limit: '1mb' }))
 
-// Unauthenticated — used by deployment platforms (e.g. Render) for health checks.
+// Unauthenticated — used by the Docker HEALTHCHECK. Returns 503 when the
+// process is up but not actually doing its job (database down, WhatsApp
+// sessions never booted, an org's primary session down for 10+ minutes),
+// so `docker ps` shows "unhealthy" instead of a reassuring "healthy" while
+// nothing is being sent. Summary only — no names, numbers or error text.
 app.get('/api/health', (_req, res) => {
-  res.json({ status: 'ok' })
+  const report = buildHealthReport()
+  res.status(report.status === 'ok' ? 200 : 503).json({
+    status: report.status,
+    problemCount: report.problems.length,
+    db: report.db.ok,
+    sessionsBooted: report.sessionsBoot.ok,
+    queuesRunning: report.queuesRunning,
+    sessionsConnected: report.sessions.filter((s) => s.live).length,
+    sessionsTotal: report.sessions.length,
+    uptimeSeconds: report.uptimeSeconds
+  })
 })
 
 const apiRouter = express.Router()
@@ -58,6 +74,12 @@ apiRouter.use(authRouter)
 
 apiRouter.use(requireAuth)
 apiRouter.use(writeRateLimit)
+
+// Full diagnostic report: exact problems, per-session state and disconnect
+// reasons, last crash, and the recent incident log.
+apiRouter.get('/system/health', requireSuperAdmin, (_req, res) => {
+  res.json(buildHealthReport())
+})
 
 apiRouter.use(connectionRouter)
 apiRouter.use(contactsRouter)
@@ -77,6 +99,7 @@ apiRouter.use(sharedAccessRouter)
 apiRouter.use(chatRouter)
 apiRouter.use(recurringRemindersRouter)
 apiRouter.use(reportTrackerRouter)
+apiRouter.use(aiRouter)
 
 app.use('/api', apiRouter)
 

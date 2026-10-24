@@ -1,10 +1,8 @@
 import { Pool } from 'pg'
 import { Kysely, PostgresDialect } from 'kysely'
-import pino from 'pino'
+import { logger } from '../lib/logger.js'
 import type { Database } from './schema.js'
-import { env, isProduction } from '../config/env.js'
-
-const logger = pino({ level: isProduction ? 'error' : 'warn' })
+import { env } from '../config/env.js'
 
 // Hosted Postgres (Supabase et al.) rejects unencrypted connections, unlike
 // a bare local dev instance — enable SSL for anything that isn't localhost.

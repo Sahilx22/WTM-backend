@@ -1,5 +1,7 @@
 import { PgBoss } from 'pg-boss'
 import { env } from '../config/env.js'
+import { logger } from '../lib/logger.js'
+import { recordIncident, errorMessage } from '../lib/systemHealth.js'
 
 export const QUEUE_SEND_MESSAGE = 'send-message'
 
@@ -18,7 +20,13 @@ export const boss = new PgBoss({
   ssl: isLocalDb ? undefined : { rejectUnauthorized: false }
 })
 
-boss.on('error', (err: Error) => console.error('pg-boss error:', err))
+// pg-boss recovers from these on its own (its workers keep polling), but
+// they're recorded so a run of them — e.g. the database dropping
+// connections — shows up on /api/health instead of only in raw logs.
+boss.on('error', (err: Error) => {
+  logger.error({ err }, 'pg-boss error')
+  recordIncident('queue_error', `pg-boss error: ${errorMessage(err)}`)
+})
 
 let started = false
 

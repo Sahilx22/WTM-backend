@@ -6,6 +6,7 @@ import { parseTaskMessage, isThumbsUp, isDoneReply } from './taskParser.js'
 import { scheduleNextReminder } from '../queue/taskReminders.js'
 import { recordAuditLog } from '../lib/auditLog.js'
 import { completeTask, markNeedsReview } from '../lib/taskCompletion.js'
+import type { TaskPriority } from '../db/schema.js'
 
 const logger = pino({ level: isProduction ? 'error' : 'warn' })
 
@@ -69,6 +70,88 @@ function stripMentionText(text: string, mentionedJids: string[]): string {
   return cleaned.replace(/[ \t]+/g, ' ').trim()
 }
 
+export interface NewTaskInput {
+  recipientJid: string
+  contactId: number | null
+  assignedJid: string | null
+  name: string
+  category: string | null
+  priority: TaskPriority
+  timesPerDay: number | null
+  intervalDays: number | null
+  targetDate: Date | null
+  neverCompletes: boolean
+  sessionId: number | null
+  organizationId: number | null
+}
+
+// The one place a task row gets created from WhatsApp — a typed #task
+// message (below) or the @ai assistant (src/ai/tools.ts) — so both always
+// link the message(s) that replies/reactions are tracked against, schedule
+// the first reminder, and audit-log the same way.
+export async function insertTask(
+  input: NewTaskInput,
+  originalMessageIds: string[],
+  audit: { action: string; metadata?: Record<string, unknown> }
+): Promise<number> {
+  const created = await db
+    .insertInto('tasks')
+    .values({
+      recipient_jid: input.recipientJid,
+      contact_id: input.contactId,
+      assigned_jid: input.assignedJid,
+      name: input.name,
+      category: input.category,
+      priority: input.priority,
+      reminder_times_per_day: input.timesPerDay,
+      reminder_interval_days: input.intervalDays,
+      target_date: input.targetDate,
+      status: 'pending',
+      created_by_session_id: input.sessionId,
+      organization_id: input.organizationId,
+      never_completes: input.neverCompletes
+    })
+    .returning('id')
+    .executeTakeFirstOrThrow()
+
+  for (const waMessageId of originalMessageIds) {
+    await linkTaskMessage(created.id, waMessageId)
+  }
+
+  if (input.timesPerDay || input.intervalDays) {
+    await scheduleNextReminder(created.id)
+  }
+
+  await recordAuditLog({
+    userId: null,
+    action: audit.action,
+    entityType: 'task',
+    entityId: created.id,
+    metadata: {
+      name: input.name,
+      category: input.category,
+      priority: input.priority,
+      timesPerDay: input.timesPerDay,
+      intervalDays: input.intervalDays,
+      targetDate: input.targetDate,
+      neverCompletes: input.neverCompletes,
+      recipientJid: input.recipientJid,
+      sessionId: input.sessionId,
+      assignedJid: input.assignedJid,
+      ...audit.metadata
+    }
+  })
+
+  return created.id
+}
+
+// Ties a WhatsApp message to a task as one of its "original" messages, so a
+// quote-reply ("done", or any note) or 👍 reaction to it is tracked against
+// that task.
+export async function linkTaskMessage(taskId: number, waMessageId: string): Promise<void> {
+  await db.insertInto('task_messages').values({ task_id: taskId, wa_message_id: waMessageId, kind: 'original' }).execute()
+}
+
 // One group #task message can @mention several employees at once — each
 // gets its own independent task (own status, own reminders), all still
 // delivered to the group chat (recipient_jid stays the group's jid; only
@@ -101,46 +184,11 @@ async function createTasksFromPhoneMessage(
       : [{ contactId: await resolveContactId(sock, recipientJid, organizationId), assignedJid: null as string | null }]
 
   for (const assignee of assignees) {
-    const created = await db
-      .insertInto('tasks')
-      .values({
-        recipient_jid: recipientJid,
-        contact_id: assignee.contactId,
-        assigned_jid: assignee.assignedJid,
-        name: parsed.name,
-        category: parsed.category,
-        priority: parsed.priority,
-        reminder_times_per_day: parsed.timesPerDay,
-        reminder_interval_days: parsed.intervalDays,
-        target_date: parsed.targetDate,
-        status: 'pending',
-        created_by_session_id: sessionId,
-        organization_id: organizationId,
-        never_completes: parsed.neverCompletes
-      })
-      .returning('id')
-      .executeTakeFirstOrThrow()
-
-    await db
-      .insertInto('task_messages')
-      .values({ task_id: created.id, wa_message_id: originalMessageId, kind: 'original' })
-      .execute()
-
-    if (parsed.timesPerDay || parsed.intervalDays) {
-      await scheduleNextReminder(created.id)
-    }
-
-    logger.info(
-      { taskId: created.id, name: parsed.name, recipientJid, sessionId, assignedJid: assignee.assignedJid },
-      'created task from phone message'
-    )
-
-    await recordAuditLog({
-      userId: null,
-      action: 'task_created_from_whatsapp',
-      entityType: 'task',
-      entityId: created.id,
-      metadata: {
+    const taskId = await insertTask(
+      {
+        recipientJid,
+        contactId: assignee.contactId,
+        assignedJid: assignee.assignedJid,
         name: parsed.name,
         category: parsed.category,
         priority: parsed.priority,
@@ -148,11 +196,17 @@ async function createTasksFromPhoneMessage(
         intervalDays: parsed.intervalDays,
         targetDate: parsed.targetDate,
         neverCompletes: parsed.neverCompletes,
-        recipientJid,
         sessionId,
-        assignedJid: assignee.assignedJid
-      }
-    })
+        organizationId
+      },
+      [originalMessageId],
+      { action: 'task_created_from_whatsapp' }
+    )
+
+    logger.info(
+      { taskId, name: parsed.name, recipientJid, sessionId, assignedJid: assignee.assignedJid },
+      'created task from phone message'
+    )
   }
 }
 

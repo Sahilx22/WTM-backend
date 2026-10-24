@@ -1,4 +1,5 @@
-import pino from 'pino'
+import { logger } from '../lib/logger.js'
+import { recordIncident, errorMessage } from '../lib/systemHealth.js'
 import { startBoss, stopBoss, isBossStarted } from './boss.js'
 import { startOutgoingWorker } from './outgoingWorker.js'
 import { initTaskReminderQueue, startTaskReminderWorker } from './taskReminders.js'
@@ -12,10 +13,7 @@ import {
 } from './recurringReminders.js'
 import { initReportCheckQueue, startReportCheckWorker, scheduleUnscheduledReportOccurrences } from './reportSubmissions.js'
 import { connectionEvents, isAnySessionConnected } from '../whatsapp/connectionManager.js'
-import { isProduction } from '../config/env.js'
 import type { TaskSettings } from '../db/schema.js'
-
-const logger = pino({ level: isProduction ? 'error' : 'warn' })
 
 // pg-boss (the outgoing-message queue, task reminders, auto-reports,
 // digests, recurring tasks) holds its own small pool of Postgres
@@ -98,6 +96,7 @@ export async function ensureQueuesRunning(): Promise<void> {
     logger.info('queue workers started — a WhatsApp session is connected')
   } catch (err) {
     logger.error({ err }, 'failed to start queue workers — will retry shortly')
+    recordIncident('queue_start_failed', `Queue workers failed to start: ${errorMessage(err)}`)
     // startBoss() may have partially succeeded (its own connections opened,
     // ours registered as started, but createQueue/worker registration
     // failed) — release whatever it did open before retrying, so a retry

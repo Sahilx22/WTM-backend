@@ -48,7 +48,17 @@ const HELP_TEXT = `*WA Messenger commands*
 
 *Chat log*
 /chat <id> — everything discussed about this task (reply/quote a task or reminder message to log a note on it)
-/summary <id or task name> [dd-mm-yy] — same as /chat but also works by task name, and can be scoped to one day. Also works as a direct message from a task's own recipient straight to your number — they'll get their own task's chat log back, scoped to their own tasks only.`
+/summary <id or task name> [dd-mm-yy] — same as /chat but also works by task name, and can be scoped to one day. Also works as a direct message from a task's own recipient straight to your number — they'll get their own task's chat log back, scoped to their own tasks only.
+
+*AI assistant* — start any message with @ai
+In this self-chat, ask in plain language, e.g.:
+@ai how many tasks are waiting for review?
+@ai how many tasks were completed today, by employee?
+@ai who has the most overdue tasks this week?
+@ai assign Priya "send the GST invoice" P1 due Monday, remind twice a day
+@ai push #42 to next Friday and make it P2
+@ai send me this month's report PDF for Rahul
+In someone else's chat or a group, @ai only creates a task for that chat (e.g. "@ai @Priya finish the site photos by tomorrow, high priority") — any other answer comes back here privately.`
 
 // Sort actionable items first: pending, then needs review, then completed.
 const STATUS_SORT_ORDER: Record<string, number> = {
@@ -150,7 +160,7 @@ async function handleStatusCommand(
   })
 }
 
-async function handleReportCommand(
+export async function handleReportCommand(
   sock: WASocket,
   ownJid: string,
   organizationId: number,
@@ -470,7 +480,7 @@ async function handleRecurCommand(
 // (see WhiskeySockets' own getKeyAuthor helper, which does the same thing).
 // Never compare JIDs with `===` directly — always go through areJidsSameUser
 // so device suffixes don't cause false negatives either.
-function isSelfChat(m: WAMessage, ownJid: string): boolean {
+export function isSelfChat(m: WAMessage, ownJid: string): boolean {
   const remote = m.key.remoteJid
   const remoteAlt = m.key.remoteJidAlt
   if (remote && areJidsSameUser(remote, ownJid)) return true

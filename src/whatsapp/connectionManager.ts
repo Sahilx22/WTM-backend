@@ -18,6 +18,8 @@ import { AUTH_SESSIONS_DIR } from '../config/paths.js'
 import { isProduction } from '../config/env.js'
 import { db } from '../db/index.js'
 import { recordAuditLog } from '../lib/auditLog.js'
+import { logger } from '../lib/logger.js'
+import { health, recordIncident, errorMessage } from '../lib/systemHealth.js'
 import {
   groupMetadataCache,
   msgRetryCounterCache,
@@ -30,9 +32,20 @@ import { handleCommandMessage } from './commandEngine.js'
 import { persistChatMessage } from './chatMessages.js'
 import { handleRecurringReminderMessage } from './recurringReminderEngine.js'
 import { handleReportSubmissionMessage } from './reportSubmissionEngine.js'
+import { handleAiMessage, isAiRequest } from './aiEngine.js'
 import type { ConnectionStatus, WhatsappSession } from '../db/schema.js'
 
-const logger = pino({ level: isProduction ? 'error' : 'warn' })
+// Handed to Baileys itself only — its internals log constantly at info/warn
+// (every decrypt retry, every prekey upload), so it stays at 'error'. Our
+// own connection-lifecycle events go through the shared app `logger`.
+const baileysLogger = pino({ level: isProduction ? 'error' : 'warn' })
+
+// Reconnect backoff after an unexpected close: 3s, 6s, 12s … capped at 60s,
+// reset on every successful open. Never gives up — the session watchdog
+// (whatsapp/watchdog.ts) is the second line of defence if this chain is
+// ever broken.
+const RECONNECT_BASE_DELAY_MS = 3_000
+const RECONNECT_MAX_DELAY_MS = 60_000
 
 // A single organization can now have more than one linked WhatsApp number
 // ("session") — the org's own number plus, optionally, one per employee who
@@ -61,6 +74,10 @@ interface SessionRuntime {
   snapshot: SessionSnapshot
   starting: boolean
   reconnectTimer: NodeJS.Timeout | null
+  reconnectAttempts: number
+  // When this session last left 'connected' in this process — used by the
+  // watchdog to tell a brief blip apart from a real outage.
+  disconnectedSince: number | null
 }
 
 const runtimes = new Map<number, SessionRuntime>()
@@ -72,24 +89,37 @@ function authDirFor(sessionId: number): string {
   return path.join(AUTH_SESSIONS_DIR, String(sessionId))
 }
 
+// A row's persisted 'connected' only means "connected as of the last
+// process that touched it" — no socket exists in THIS process until
+// startConnection() opens one. Reporting that stale status is how the UI
+// once showed "connected" for days while nothing was actually running, so
+// it's downgraded here until a live socket really opens.
 function snapshotFromRow(row: WhatsappSession): SessionSnapshot {
+  const stale = row.status === 'connected' || row.status === 'connecting'
   return {
     sessionId: row.id,
     organizationId: row.organization_id,
     label: row.label,
     isPrimary: row.is_primary,
-    status: row.status,
+    status: stale ? 'disconnected' : row.status,
     qrDataUrl: null,
     phoneNumber: row.phone_number,
     waJid: row.wa_jid,
-    lastDisconnectReason: row.last_disconnect_reason
+    lastDisconnectReason: stale ? 'Not reconnected since the server restarted' : row.last_disconnect_reason
   }
 }
 
 function ensureRuntime(row: WhatsappSession): SessionRuntime {
   let runtime = runtimes.get(row.id)
   if (!runtime) {
-    runtime = { sock: null, snapshot: snapshotFromRow(row), starting: false, reconnectTimer: null }
+    runtime = {
+      sock: null,
+      snapshot: snapshotFromRow(row),
+      starting: false,
+      reconnectTimer: null,
+      reconnectAttempts: 0,
+      disconnectedSince: Date.now()
+    }
     runtimes.set(row.id, runtime)
   }
   return runtime
@@ -161,7 +191,7 @@ export function getPrimarySnapshotForOrganization(organizationId: number): Sessi
 // by queue/lifecycle.ts to decide whether pg-boss (reminders, auto-reports,
 // digests, the outgoing-message queue) has anything to do at all right now.
 export function isAnySessionConnected(): boolean {
-  return [...runtimes.values()].some((r) => r.snapshot.status === 'connected')
+  return [...runtimes.values()].some((r) => r.snapshot.status === 'connected' && r.sock)
 }
 
 // Every organization that currently has a connected primary session — used
@@ -215,9 +245,17 @@ async function persistSnapshot(sessionId: number): Promise<void> {
 function updateSnapshot(sessionId: number, partial: Partial<SessionSnapshot>): void {
   const runtime = runtimes.get(sessionId)
   if (!runtime) return
+  const wasConnected = runtime.snapshot.status === 'connected'
   runtime.snapshot = { ...runtime.snapshot, ...partial }
+  if (runtime.snapshot.status === 'connected') {
+    runtime.disconnectedSince = null
+  } else if (wasConnected || runtime.disconnectedSince === null) {
+    runtime.disconnectedSince = Date.now()
+  }
   connectionEvents.emit('update', runtime.snapshot)
-  void persistSnapshot(sessionId)
+  persistSnapshot(sessionId).catch((err) => {
+    logger.error({ err, sessionId }, 'failed to persist WhatsApp session status')
+  })
 }
 
 export async function createSession(organizationId: number, label?: string): Promise<SessionSnapshot> {
@@ -269,10 +307,10 @@ export async function startConnection(sessionId: number): Promise<void> {
 
     const sock = makeWASocket({
       version,
-      logger,
+      logger: baileysLogger,
       auth: {
         creds: state.creds,
-        keys: makeCacheableSignalKeyStore(state.keys, logger)
+        keys: makeCacheableSignalKeyStore(state.keys, baileysLogger)
       },
       browser: Browsers.ubuntu('WA Messenger'),
       markOnlineOnConnect: false,
@@ -285,12 +323,23 @@ export async function startConnection(sessionId: number): Promise<void> {
 
     sock.ev.on('creds.update', saveCreds)
 
+    // Every branch below is wrapped so a failing DB write (audit log,
+    // primary lookup) can never stop the in-memory status from updating —
+    // previously a rejected query here could leave an open socket stuck at
+    // 'connecting', which keeps the reminder/report queues paused.
     sock.ev.on('connection.update', async (update) => {
       const { connection, lastDisconnect, qr } = update
+      const label = runtime.snapshot.label
+      const organizationId = runtime.snapshot.organizationId
 
       if (qr) {
-        const qrDataUrl = await qrcode.toDataURL(qr)
-        updateSnapshot(sessionId, { status: 'qr_pending', qrDataUrl })
+        try {
+          const qrDataUrl = await qrcode.toDataURL(qr)
+          updateSnapshot(sessionId, { status: 'qr_pending', qrDataUrl })
+        } catch (err) {
+          logger.error({ err, sessionId }, 'failed to render WhatsApp QR code')
+        }
+        logger.info({ sessionId, organizationId, label }, 'WhatsApp session is waiting for a QR scan')
       }
 
       if (connection === 'connecting') {
@@ -300,15 +349,22 @@ export async function startConnection(sessionId: number): Promise<void> {
         const decoded = rawId ? jidDecode(rawId) : null
 
         // First session this organization has ever successfully connected
-        // becomes (and permanently stays) primary.
-        const existingPrimary = await db
-          .selectFrom('whatsapp_sessions')
-          .select('id')
-          .where('organization_id', '=', runtime.snapshot.organizationId)
-          .where('is_primary', '=', true)
-          .executeTakeFirst()
-        const isPrimary = runtime.snapshot.isPrimary || !existingPrimary
+        // becomes (and permanently stays) primary. If the lookup fails, keep
+        // whatever primary flag we already had rather than blocking connect.
+        let isPrimary = runtime.snapshot.isPrimary
+        try {
+          const existingPrimary = await db
+            .selectFrom('whatsapp_sessions')
+            .select('id')
+            .where('organization_id', '=', organizationId)
+            .where('is_primary', '=', true)
+            .executeTakeFirst()
+          isPrimary = runtime.snapshot.isPrimary || !existingPrimary
+        } catch (err) {
+          logger.error({ err, sessionId }, 'failed to look up primary session on connect — keeping existing primary flag')
+        }
 
+        runtime.reconnectAttempts = 0
         updateSnapshot(sessionId, {
           status: 'connected',
           qrDataUrl: null,
@@ -317,22 +373,44 @@ export async function startConnection(sessionId: number): Promise<void> {
           lastDisconnectReason: null,
           isPrimary
         })
-        await recordAuditLog({ userId: null, action: 'whatsapp_connected', entityType: 'whatsapp_connection', entityId: sessionId })
+        logger.info({ sessionId, organizationId, label, isPrimary }, 'WhatsApp session connected')
+        recordAuditLog({ userId: null, action: 'whatsapp_connected', entityType: 'whatsapp_connection', entityId: sessionId }).catch(
+          (err) => logger.error({ err, sessionId }, 'failed to write whatsapp_connected audit log')
+        )
       } else if (connection === 'close') {
         const boomError = lastDisconnect?.error as Boom | undefined
         const statusCode = boomError?.output?.statusCode
         const loggedOut = statusCode === DisconnectReason.loggedOut
+        const reason = boomError?.message ?? 'Connection closed'
+        if (runtime.sock === sock) runtime.sock = null
 
         updateSnapshot(sessionId, {
           status: 'disconnected',
           qrDataUrl: null,
-          lastDisconnectReason: boomError?.message ?? 'Connection closed'
+          lastDisconnectReason: reason
         })
 
         if (loggedOut) {
-          await clearAuthState(sessionId)
-          await recordAuditLog({ userId: null, action: 'whatsapp_logged_out', entityType: 'whatsapp_connection', entityId: sessionId })
+          logger.warn({ sessionId, organizationId, label, statusCode, reason }, 'WhatsApp session was logged out — it must be re-linked by scanning a new QR code')
+          recordIncident('session_logged_out', `Session ${sessionId} (${label ?? 'unlabelled'}) was logged out by WhatsApp — needs a new QR scan`, {
+            sessionId,
+            organizationId,
+            statusCode,
+            reason
+          })
+          try {
+            await clearAuthState(sessionId)
+            await recordAuditLog({ userId: null, action: 'whatsapp_logged_out', entityType: 'whatsapp_connection', entityId: sessionId, metadata: { statusCode, reason } })
+          } catch (err) {
+            logger.error({ err, sessionId }, 'failed to clean up after WhatsApp logout')
+          }
         } else {
+          logger.warn({ sessionId, organizationId, label, statusCode, reason }, 'WhatsApp session disconnected — scheduling reconnect')
+          recordIncident('session_disconnected', `Session ${sessionId} (${label ?? 'unlabelled'}) disconnected: ${reason}`, {
+            sessionId,
+            organizationId,
+            statusCode
+          })
           scheduleReconnect(sessionId)
         }
       }
@@ -372,6 +450,18 @@ export async function startConnection(sessionId: number): Promise<void> {
     sock.ev.on('messages.upsert', async ({ messages, type }) => {
       if (type !== 'notify') return
       for (const m of messages) {
+        // An "@ai" message is handled only by the assistant (in the
+        // background — see handleAiMessage), never also as a #task, #sced
+        // or command, so one message can't create something twice.
+        if (runtime.snapshot.waJid && isAiRequest(m, runtime.snapshot.waJid)) {
+          handleAiMessage(sock, m, sessionId, runtime.snapshot.organizationId, runtime.snapshot.waJid)
+          try {
+            await persistChatMessage(sock, m, runtime.snapshot.organizationId)
+          } catch (err) {
+            logger.warn({ err, key: m.key }, 'failed persisting chat message')
+          }
+          continue
+        }
         try {
           await handleMessageForTasks(sock, m, sessionId, runtime.snapshot.organizationId)
         } catch (err) {
@@ -432,13 +522,80 @@ export async function startConnection(sessionId: number): Promise<void> {
   }
 }
 
+// Retries with exponential backoff until a connection attempt succeeds. A
+// failed attempt (e.g. the database is briefly unreachable, so
+// startConnection()'s first query rejects) used to be an unhandled
+// rejection that silently ended the reconnect chain for good — now it's
+// logged and simply retried.
 function scheduleReconnect(sessionId: number): void {
   const runtime = runtimes.get(sessionId)
-  if (!runtime || runtime.reconnectTimer) return
+  if (!runtime || runtime.reconnectTimer || shuttingDownSockets) return
+  const delay = Math.min(RECONNECT_BASE_DELAY_MS * 2 ** runtime.reconnectAttempts, RECONNECT_MAX_DELAY_MS)
+  runtime.reconnectAttempts += 1
   runtime.reconnectTimer = setTimeout(() => {
     runtime.reconnectTimer = null
-    void startConnection(sessionId)
-  }, 3000)
+    startConnection(sessionId).catch((err) => {
+      logger.error({ err, sessionId, attempt: runtime.reconnectAttempts }, 'WhatsApp reconnect attempt failed — retrying')
+      recordIncident('session_reconnect_failed', `Session ${sessionId} reconnect attempt ${runtime.reconnectAttempts} failed: ${errorMessage(err)}`, {
+        sessionId
+      })
+      scheduleReconnect(sessionId)
+    })
+  }, delay)
+}
+
+// Used by the watchdog — true once this session has ever completed QR
+// linking (Baileys has written its creds). A session without them can only
+// be fixed by a human scanning a QR, so there's nothing to auto-retry.
+export function hasSavedCreds(sessionId: number): boolean {
+  return fs.existsSync(path.join(authDirFor(sessionId), 'creds.json'))
+}
+
+export interface RuntimeState {
+  sessionId: number
+  organizationId: number
+  label: string | null
+  isPrimary: boolean
+  status: ConnectionStatus
+  hasSocket: boolean
+  starting: boolean
+  reconnectPending: boolean
+  reconnectAttempts: number
+  disconnectedSince: number | null
+  lastDisconnectReason: string | null
+}
+
+export function listRuntimeStates(): RuntimeState[] {
+  return [...runtimes.values()].map((r) => ({
+    sessionId: r.snapshot.sessionId,
+    organizationId: r.snapshot.organizationId,
+    label: r.snapshot.label,
+    isPrimary: r.snapshot.isPrimary,
+    status: r.snapshot.status,
+    hasSocket: Boolean(r.sock),
+    starting: r.starting,
+    reconnectPending: Boolean(r.reconnectTimer),
+    reconnectAttempts: r.reconnectAttempts,
+    disconnectedSince: r.disconnectedSince,
+    lastDisconnectReason: r.snapshot.lastDisconnectReason
+  }))
+}
+
+// Watchdog entry point: picks up sessions this process doesn't know about
+// yet (e.g. created while boot was still retrying) and kicks a reconnect
+// for any linked session that has silently fallen out of its retry chain.
+export async function reviveStalledSessions(): Promise<number[]> {
+  const rows = await db.selectFrom('whatsapp_sessions').selectAll().execute()
+  const revived: number[] = []
+  for (const row of rows) {
+    const runtime = ensureRuntime(row)
+    const live = runtime.snapshot.status === 'connected' && runtime.sock
+    const busy = runtime.starting || runtime.reconnectTimer || runtime.snapshot.status === 'connecting'
+    if (live || busy || !hasSavedCreds(row.id)) continue
+    revived.push(row.id)
+    scheduleReconnect(row.id)
+  }
+  return revived
 }
 
 async function clearAuthState(sessionId: number): Promise<void> {
@@ -457,7 +614,16 @@ export async function requestConnect(sessionId: number): Promise<void> {
 }
 
 export async function requestLogout(sessionId: number, userId: number | null): Promise<void> {
-  const runtime = runtimes.get(sessionId)
+  // Make sure a runtime exists even if this process never booted the
+  // session — otherwise clearAuthState()'s status update is a silent no-op
+  // and the database keeps reporting a stale 'connected'.
+  const row = await db.selectFrom('whatsapp_sessions').selectAll().where('id', '=', sessionId).executeTakeFirst()
+  const runtime = row ? ensureRuntime(row) : runtimes.get(sessionId)
+  if (runtime?.reconnectTimer) {
+    clearTimeout(runtime.reconnectTimer)
+    runtime.reconnectTimer = null
+  }
+  logger.warn({ sessionId, userId }, 'WhatsApp session manually disconnected — saved login cleared, needs a new QR scan')
   if (runtime?.sock) {
     try {
       await runtime.sock.logout()
@@ -497,10 +663,49 @@ export async function bootAllSessions(): Promise<void> {
   for (const row of rows) {
     ensureRuntime(row)
   }
+  logger.info({ sessions: rows.map((r) => ({ id: r.id, org: r.organization_id, label: r.label, linked: hasSavedCreds(r.id) })) }, 'booting WhatsApp sessions')
   for (const row of rows) {
-    void startConnection(row.id).catch((err) => {
-      logger.error({ err, sessionId: row.id }, 'failed to start WhatsApp session on boot')
+    startConnection(row.id).catch((err) => {
+      logger.error({ err, sessionId: row.id }, 'failed to start WhatsApp session on boot — scheduling retry')
+      scheduleReconnect(row.id)
     })
+  }
+}
+
+const BOOT_RETRY_BASE_DELAY_MS = 5_000
+const BOOT_RETRY_MAX_DELAY_MS = 60_000
+
+// The production outage this guards against: the process crashed on a
+// dropped database connection, Docker restarted it while the database was
+// still refusing connections, and the one-shot bootAllSessions() call
+// failed — leaving the HTTP server up and "healthy" but with zero WhatsApp
+// sockets for days. This keeps retrying (5s, 10s, 20s … capped at 60s)
+// until the boot query succeeds, recording every failure where
+// /api/health and the logs can show it.
+export async function bootAllSessionsWithRetry(): Promise<void> {
+  for (;;) {
+    if (shuttingDownSockets) return
+    health.sessionsBoot.attempts += 1
+    try {
+      await bootAllSessions()
+      health.sessionsBoot.ok = true
+      health.sessionsBoot.succeededAt = new Date().toISOString()
+      if (health.sessionsBoot.attempts > 1) {
+        logger.warn({ attempts: health.sessionsBoot.attempts }, 'WhatsApp session boot succeeded after retrying')
+        recordIncident('session_boot_recovered', `WhatsApp session boot succeeded after ${health.sessionsBoot.attempts} attempts`, {
+          lastError: health.sessionsBoot.lastError
+        })
+      }
+      return
+    } catch (err) {
+      const attempt = health.sessionsBoot.attempts
+      const delay = Math.min(BOOT_RETRY_BASE_DELAY_MS * 2 ** (attempt - 1), BOOT_RETRY_MAX_DELAY_MS)
+      health.sessionsBoot.lastError = errorMessage(err)
+      health.sessionsBoot.lastErrorAt = new Date().toISOString()
+      logger.error({ err, attempt, retryInMs: delay }, 'WhatsApp session boot failed — retrying')
+      recordIncident('session_boot_failed', `WhatsApp session boot attempt ${attempt} failed: ${errorMessage(err)}`, { retryInMs: delay })
+      await new Promise((resolve) => setTimeout(resolve, delay))
+    }
   }
 }
 
@@ -512,7 +717,10 @@ export async function bootAllSessions(): Promise<void> {
 // block process exit, and this intentionally does NOT touch the database —
 // no session status is persisted here, since bootAllSessions() will just
 // resume from saved auth state on the next boot regardless.
+let shuttingDownSockets = false
+
 export function shutdownAllSockets(): void {
+  shuttingDownSockets = true
   for (const runtime of runtimes.values()) {
     if (runtime.reconnectTimer) {
       clearTimeout(runtime.reconnectTimer)
